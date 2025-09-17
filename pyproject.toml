@@ -1,0 +1,18 @@
+[project]
+name = "osm-retrieve"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "geopandas>=1.1.1",
+    "libpysal>=4.13.0",
+    "matplotlib>=3.10.6",
+    "mpld3>=0.5.11",
+    "osmnx>=2.0.6",
+]
+
+[dependency-groups]
+dev = [
+    "pandas-stubs>=2.3.2.250827",
+]
