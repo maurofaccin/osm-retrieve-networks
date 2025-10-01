@@ -13,6 +13,7 @@ from numbers import Number
 from pathlib import Path
 from typing import Self
 
+import networkx as nx
 import geopandas as geopd
 import logconfig
 import numpy as np
@@ -40,10 +41,11 @@ log = logging.getLogger(__name__)
 
 
 def osm_powerlines(
-    place: str,
+    place: str | geometry.Polygon | geometry.MultiPolygon,
     substation_distance: float = 500,
     voltage_fillvalue: float | None = None,
     voltage_threshold: float = 1000,
+    node_prefix: str = "",
 ) -> tuple[Graph, geopd.GeoDataFrame]:
     """Retrieve the powerline network.
 
@@ -58,22 +60,48 @@ def osm_powerlines(
 
     Returns
     -------
-    nodes : GeoDataFrame
-        the nodes
-    edges : GeoDataFrame
-        the edges
+    graph : Graph
+        nodes and edges
     powerplants : GeoDataFrame
         the powerplants
-
-
     """
     # Retrieving the enclosing poligon.
-    enclosing_polygon = get_geolocation(place=place)
+    enclosing_polygon = get_geolocation(place=place) if isinstance(place, str) else place
+    if enclosing_polygon.area > 10:
+        log.warning(f"Area of size {enclosing_polygon.area}")
+    else:
+        log.info(f"Area of size {enclosing_polygon.area}")
     # Retrieve lines from OpenStreetMap.
     log.info("Retrieving edges from OpenStreetMap.")
     edges = retrieve_edges(keys={"power": ["cable", "line"]}, polygon=enclosing_polygon).rename(
         columns={"source": "power_source"}
     )
+    edges = edges[
+        edges.columns.intersection(
+            [
+                "id",
+                "index",
+                "cables",
+                "capacity",
+                "frequency",
+                "line",
+                "geometry",
+                "maxcurrent",
+                "name",
+                "operator",
+                "power",
+                "power:maximum",
+                "power:used",
+                "power_source",
+                "source",
+                "sourve:power",
+                "submarine",
+                "target",
+                "type",
+                "voltage",
+            ]
+        )
+    ]
     edges.voltage = _clean_voltage(edges.voltage)
     if voltage_fillvalue is None:
         edges = edges.dropna(subset="voltage")
@@ -95,14 +123,16 @@ def osm_powerlines(
     log.info("get nodes")
     substations = retrieve_nodes(keys={"power": ["substation"]}, polygon=substation_polygon)
     log.info("add substations fuzzily")
-    edges[edges["id"] == 1342197763].to_file("ciccio.geojson")
-    substations.to_file("ciccio_pasticcio.geojson")
-    edges = add_fuzzy_nodes(substations, edges, distance=substation_distance)
+    if len(substations) > 0:
+        edges = add_fuzzy_nodes(substations, edges, distance=substation_distance)
     log.info("Build graph")
-    graph = Graph(edges=edges, region=enclosing_polygon)
+    graph = Graph(
+        edges=edges,
+        region=geopd.GeoDataFrame([{"region": 0}], geometry=[enclosing_polygon], crs=PRJ_DEG),
+    )
 
     log.info("Get nodes from edges extremes.")
-    graph = graph.nodes_from_edges(node_prefix=place + "_")
+    graph = graph.nodes_from_edges(node_prefix=node_prefix)
 
     log.info("Get power plants.")
     powerplants = retrieve_nodes(keys={"power": ["plant"]}, polygon=enclosing_polygon)
@@ -139,15 +169,16 @@ def retrieve_nodes(
     log.info("Retrieving `Point` data from OpenStreetMap.")
     data = []
     for k, vals in keys.items():
+        tags = {k: vals}
         try:
             if place is not None:
-                _data = ox.features_from_place(place, {k: vals})
+                _data = ox.features_from_place(place, tags)
             elif polygon is not None:
-                _data = ox.features_from_polygon(polygon, {k: vals})
+                _data = ox.features_from_polygon(polygon, tags)
             else:
                 raise ValueError("You should provide either `place` or `polygon`.")
         except ox._errors.InsufficientResponseError:
-            log.warning(f"No data for {dict(k=vals)}. Skipping")
+            log.warning(f"No data for {tags}. Skipping")
             pass
         else:
             if isinstance(_data, list):
@@ -156,6 +187,8 @@ def retrieve_nodes(
                 data.append(_data)
 
     # Build a `DataFrame`
+    if len(data) == 0:
+        return geopd.GeoDataFrame([], geometry=[], crs=PRJ_DEG)
     nodes = geopd.GeoDataFrame(pd.concat(data), geometry="geometry", crs=PRJ_DEG).droplevel(0)
     nodes.columns = [c.replace(":", "_") for c in nodes.columns]
     nodes = nodes.dropna(how="all", axis=1)
@@ -227,7 +260,11 @@ def retrieve_edges(
 class Graph:
     nodes: geopd.GeoDataFrame = field(init=False)
     edges: geopd.GeoDataFrame
-    region: geometry.Polygon | geometry.MultiPolygon
+    region: geopd.GeoDataFrame
+
+    @property
+    def region_shape(self):
+        return self.region.union_all(method="coverage")
 
     def nodes_from_edges(
         self, source_col: str = "source", target_col: str = "target", node_prefix: str = ""
@@ -288,10 +325,20 @@ class Graph:
         return self.edges.index
 
     def filter_edges(self, keep_ids: list | np.ndarray | pd.Index) -> Graph:
+        """Return a new graph with only `keep_ids` edges."""
         graph = Graph(self.edges.loc[keep_ids], region=self.region)
         graph.nodes = self.nodes.loc[
             pd.concat([graph.edges.source, graph.edges.target]).drop_duplicates()
         ]
+        return graph
+
+    def filter_nodes(self, keep_ids: list | np.ndarray | pd.Index) -> Graph:
+        """Return a new graph with only the mentioned nodes."""
+        graph = Graph(
+            self.edges[(self.edges.source.isin(keep_ids)) & (self.edges.target.isin(keep_ids))],
+            region=self.region,
+        )
+        graph.nodes = self.nodes.loc[keep_ids]
         return graph
 
     def intersect(self, other: Graph, return_same: bool | None = False) -> list:
@@ -319,7 +366,7 @@ class Graph:
         """Split edges in those intersecting the other.region and the others."""
         # Edges in self, crossing to other.region
         sindex = shapely.strtree.STRtree(self.edges.geometry)
-        crossing_ids = self.edges.index[sindex.query(other.region.boundary, predicate="intersects")]
+        crossing_ids = self.edges.index[sindex.query(other.region_shape, predicate="intersects")]
 
         g_inner = self.filter_edges(self.index().difference(list(crossing_ids)))
         g_outer = self.filter_edges(crossing_ids)
@@ -345,21 +392,19 @@ class Graph:
         i1 = g_outer1.intersect(g_outer2, return_same=True)
         i2 = g_outer2.intersect(g_outer1, return_same=False)
         merged = geopd.GeoDataFrame(
-            pd.concat([
-                g_inner1.edges,
-                g_inner2.edges,
-                g_outer1.edges.loc[i1],
-                g_outer2.edges.loc[i2],
-            ]),
+            pd.concat(
+                [g_inner1.edges, g_inner2.edges, g_outer1.edges.loc[i1], g_outer2.edges.loc[i2]]
+            ),
             crs=self.edges.crs,
         )
 
         # Fix nodes
+        region2 = g_outer2.region_shape
         wrong_region = [
             node
             for k, edge in g_outer1.edges.iterrows()
             for node in edge.loc[["source", "target"]]
-            if g_outer1.nodes.loc[node].geometry.within(g_outer2.region)
+            if g_outer1.nodes.loc[node].geometry.within(region2)
         ]
         sindex = shapely.STRtree(other.nodes.geometry)
         rename = {
@@ -368,11 +413,12 @@ class Graph:
             ]
             for node in wrong_region
         }
+        region1 = g_outer1.region_shape
         wrong_region = [
             node
             for k, edge in g_outer2.edges.iterrows()
             for node in edge.loc[["source", "target"]]
-            if g_outer2.nodes.loc[node].geometry.within(g_outer1.region)
+            if g_outer2.nodes.loc[node].geometry.within(region1)
         ]
         sindex = shapely.STRtree(self.nodes.geometry)
         rename |= {
@@ -383,43 +429,57 @@ class Graph:
         }
         rename = {k: v[0] for k, v in rename.items() if len(v) > 0}
 
-        mgraph = Graph(edges=merged, region=shapely.union(self.region, other.region))
+        mgraph = Graph(
+            edges=merged.reset_index(drop=True),
+            region=geopd.GeoDataFrame(pd.concat([self.region, other.region]), crs=self.region.crs),
+        )
+        mgraph.edges.index.name = "index"
         mgraph.edges["source"] = mgraph.edges["source"].map(lambda x: rename.get(x, x))
         mgraph.edges["target"] = mgraph.edges["target"].map(lambda x: rename.get(x, x))
         mgraph.nodes = geopd.GeoDataFrame(
-            pd.concat([
-                self.nodes.loc[self.nodes.index.difference(pd.Index(rename))],
-                other.nodes.loc[other.nodes.index.difference(pd.Index(rename))],
-            ]),
+            pd.concat(
+                [
+                    self.nodes.loc[self.nodes.index.difference(pd.Index(rename))],
+                    other.nodes.loc[other.nodes.index.difference(pd.Index(rename))],
+                ]
+            ),
             crs=self.edges.crs,
         )
+        mgraph.nodes.index.name = "id"
         return mgraph
+
+    def largest_component(self):
+        g = nx.from_pandas_edgelist(self.edges, source="source", target="target")
+        largest_component = list(max(nx.connected_components(g), key=len))
+
+        return self.filter_nodes(largest_component)
 
     def __str__(self) -> str:
         return "\n".join(map(str, [self.edges, self.nodes]))
 
     @classmethod
-    def load(cls, basedir: Path, filename_fmt: str) -> Graph:
-        edges = geopd.read_file(basedir / filename_fmt.format("edges")).set_index(
-            "index", drop=True
+    def read(cls, path: Path) -> Graph:
+        edges = geopd.read_file(path, layer="edges")
+        nodes = geopd.read_file(path, layer="nodes").set_index("id", drop=True)
+        region = geopd.read_file(path, layer="region")
+
+        g = Graph(edges=edges, region=region)
+        g.nodes = nodes
+
+        return g
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        path.unlink(missing_ok=True)
+        self.edges.drop(columns=["index"], errors="ignore").to_file(
+            path, driver="GPKG", layer="edges"
         )
-        nodes = geopd.read_file(basedir / filename_fmt.format("nodes")).set_index("id", drop=True)
-        with (basedir / filename_fmt.format("region")).open("r") as fout:
-            region = shapely.from_geojson(fout.read())
-
-        graph = Graph(edges=edges, region=region)
-        graph.nodes = nodes
-        return graph
-
-    def write(self, basedir: Path, filename_fmt: str) -> None:
-        basedir.mkdir(parents=True, exist_ok=True)
-        self.edges.to_file(basedir / filename_fmt.format("edges"))
-        self.nodes.to_file(basedir / filename_fmt.format("nodes"))
-        with (basedir / filename_fmt.format("region")).open("w") as fout:
-            fout.write(shapely.to_geojson(self.region))
+        self.nodes.to_file(path, driver="GPKG", layer="nodes")
+        self.region.to_file(path, driver="GPKG", layer="region")
 
     def plot(self, ax: axes.Axes, color: str = "r", text_args: dict | None = None):
-        plotting.plot_polygon(self.region, color=color, ax=ax, alpha=0.2)
+        plotting.plot_polygon(self.region_shape, color=color, ax=ax, alpha=0.2)
         plotting.plot_line(self.edges.union_all(), color=color, ax=ax, alpha=0.3)
         if hasattr(self, "nodes"):
             plotting.plot_points(
@@ -468,7 +528,7 @@ def merge_points_within_distance(points: geopd.GeoDataFrame, distance: float) ->
         A dataframe with close points merged.
 
     """
-    log.info("Merging nodes within {distance} distance.")
+    log.info(f"Merging nodes within {distance} distance.")
     sindex = points.sindex
     points["label"] = [
         min(sindex.query(point, predicate="dwithin", distance=distance))
@@ -513,6 +573,10 @@ def add_fuzzy_nodes(
         The edges connected to the points within `distance`
 
     """
+    if "name" not in nodes.columns:
+        nodes["name"] = range(len(nodes))
+    if "name" not in edges.columns:
+        edges["name"] = range(len(edges))
     mnodes = nodes[["name", "geometry"]].copy().to_crs(PRJ_MET)
     medges = edges[["name", "geometry"]].copy().to_crs(PRJ_MET)
 
@@ -542,9 +606,7 @@ def add_fuzzy_nodes(
 
         if len(ids) > 0 and isinstance(medge, geometry.LineString):
             update[id] = _join_line_point_buffered(
-                medge,
-                geopd.GeoSeries(mnodes.geometry.iloc[ids], index=mnodes.index[ids]),
-                distance,
+                medge, geopd.GeoSeries(mnodes.geometry.iloc[ids], index=mnodes.index[ids]), distance
             )
             continue
 
@@ -657,14 +719,16 @@ def join_edges_at_points(edges: geopd.GeoDataFrame) -> geopd.GeoDataFrame:
         pd.concat(
             [
                 edges.loc[~edges.index.isin(new_edges)],
-                pd.DataFrame([
-                    edges.loc[id].to_dict() | {"geometry": line}
-                    for id, lines in new_edges.items()
-                    for line in lines
-                ]),
+                pd.DataFrame(
+                    [
+                        edges.loc[id].to_dict() | {"geometry": line}
+                        for id, lines in new_edges.items()
+                        for line in lines
+                    ]
+                ),
             ],
             ignore_index=True,
-        ),
+        )
     ).set_crs(crs=edges.crs, allow_override=True)
     if len(new_edges) == 0:
         return result
