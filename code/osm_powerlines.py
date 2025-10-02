@@ -3,14 +3,17 @@ from pathlib import Path
 import geopandas as geopd
 import osm
 import pandas as pd
+import shapely
+import tqdm
 
 
 def main() -> None:
     """Do the main."""
     # Load the countries
-    countries = geopd.read_file("../data/regions_europe.geojson").rename(
-        columns={"index": "code", "geometry": "region"}
-    )[["code", "region"]]
+    buffer = get_buffer_region(buf_size=2.0)
+    buffer.columns = ["code", "region"]
+    countries = load_countries().rename(columns={"geometry": "region"})
+    countries = geopd.GeoDataFrame(pd.concat([buffer, countries]))
     datapath = Path("../data/graphs")
 
     graph: osm.Graph | None = None
@@ -31,6 +34,7 @@ def main() -> None:
                 country["region"], substation_distance=500, node_prefix=country["code"] + "_"
             )
             pl.write(pl_path)
+            pp.to_file(pp_path)
 
         if graph is None:
             graph = osm.Graph(edges=pl.edges.copy(), region=pl.region)
@@ -41,13 +45,48 @@ def main() -> None:
         if powerplants is None:
             powerplants = pp
         else:
-            powerplants = geopd.GeoDataFrame(pd.concat([powerplants, pp]), crs=powerplants.crs)
+            powerplants = geopd.GeoDataFrame(
+                pd.concat([powerplants, pp], ignore_index=True), crs=powerplants.crs
+            )
 
         graph.write(datapath / "graph_all_graph.gpkg")
         powerplants.to_file(datapath / "graph_all_powerplants.geojson")
-        pp.to_file(pp_path)
+
+
+def get_buffer_region(buf_size: float = 2.0) -> geopd.GeoDataFrame:
+    cache = Path("../data/regions_europe_buffer.geojson")
+
+    if cache.is_file():
+        return geopd.read_file(cache)
+
+    countries = load_countries()
+    buf = None
+    for country in tqdm.tqdm(countries.geometry):
+        if buf is None:
+            buf = country.buffer(buf_size)
+        else:
+            buf = buf.union(country.buffer(buf_size), grid_size=0.01)
+
+    if buf is not None:
+        buffer = geopd.GeoDataFrame(
+            [{"region": "EU"}],
+            geometry=[shapely.difference(buf, countries.union_all(), grid_size=0.01)],
+            crs=4326,
+        )
+
+    else:
+        buffer = geopd.GeoDataFrame([], geometry=[])
+
+    # cache it
+    buffer.to_file(cache)
+    return buffer
+
+
+def load_countries() -> geopd.GeoDataFrame:
+    return geopd.read_file("../data/regions_europe.geojson").rename(columns={"index": "code"})[
+        ["code", "geometry"]
+    ]
 
 
 if __name__ == "__main__":
     main()
-    # print(load_regions())
