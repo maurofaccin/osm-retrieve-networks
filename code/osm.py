@@ -94,7 +94,7 @@ def osm_powerlines(
                 "power:used",
                 "power_source",
                 "source",
-                "sourve:power",
+                "source:power",
                 "submarine",
                 "target",
                 "type",
@@ -102,29 +102,30 @@ def osm_powerlines(
             ]
         )
     ]
-    edges.voltage = _clean_voltage(edges.voltage)
-    if voltage_fillvalue is None:
-        edges = edges.dropna(subset="voltage")
-        edges = edges[edges.voltage >= voltage_threshold]
-    else:
-        # Retains the lower voltage (1k-69k Volts) power-lines.
-        # Assumes non reported voltage is lower than 69kV.
-        # This is risky as the network is not that accurately reported.
-        edges.voltage = edges.voltage.fillna(voltage_fillvalue)
-        log.warning("You assume that edges with no voltage are below 69k.")
-    edges = join_edges_at_points(edges.reset_index(drop=False))
+    if len(edges) > 0:
+        edges.voltage = _clean_voltage(edges.voltage)
+        if voltage_fillvalue is None:
+            edges = edges.dropna(subset="voltage")
+            edges = edges[edges.voltage >= voltage_threshold]
+        else:
+            # Retains the lower voltage (1k-69k Volts) power-lines.
+            # Assumes non reported voltage is lower than 69kV.
+            # This is risky as the network is not that accurately reported.
+            edges.voltage = edges.voltage.fillna(voltage_fillvalue)
+            log.warning("You assume that edges with no voltage are below 69k.")
+        edges = join_edges_at_points(edges.reset_index(drop=False))
 
-    log.info("Retrieving substations from OpenStreetMap.")
-    # Retrieve substations (additional nodes).
-    # These substations are used to *merge* lines that do not touch.
-    substation_polygon = ops.transform(
-        MET2DEG, edges.to_crs(PRJ_MET).buffer(2 * substation_distance, resolution=2).union_all()
-    )
-    log.info("get nodes")
-    substations = retrieve_nodes(keys={"power": ["substation"]}, polygon=substation_polygon)
-    log.info("add substations fuzzily")
-    if len(substations) > 0:
-        edges = add_fuzzy_nodes(substations, edges, distance=substation_distance)
+        log.info("Retrieving substations from OpenStreetMap.")
+        # Retrieve substations (additional nodes).
+        # These substations are used to *merge* lines that do not touch.
+        substation_polygon = ops.transform(
+            MET2DEG, edges.to_crs(PRJ_MET).buffer(2 * substation_distance, resolution=2).union_all()
+        )
+        log.info("get nodes")
+        substations = retrieve_nodes(keys={"power": ["substation"]}, polygon=substation_polygon)
+        log.info("add substations fuzzily")
+        if len(substations) > 0:
+            edges = add_fuzzy_nodes(substations, edges, distance=substation_distance)
     log.info("Build graph")
     graph = Graph(
         edges=edges,
@@ -136,6 +137,31 @@ def osm_powerlines(
 
     log.info("Get power plants.")
     powerplants = retrieve_nodes(keys={"power": ["plant"]}, polygon=enclosing_polygon)
+    powerplants = powerplants[
+        powerplants.columns.intersection(
+            [
+                "id",
+                "addr_city",
+                "frequency",
+                "generator_capacity",
+                "geometry",
+                "name",
+                "operator",
+                "owner",
+                "plant_method",
+                "plant_output",
+                "plant_source",
+                "plant_storage",
+                "plant_type",
+                "power",
+                "source",
+                "type",
+                "underground",
+                "voltage",
+                "voltage",
+            ]
+        )
+    ]
 
     return graph, powerplants
 
@@ -225,17 +251,24 @@ def retrieve_edges(
     log.info("Retrieving `LineString` data from OpenStreetMap.")
     data = []
     for k, vals in keys.items():
-        if place is not None:
-            features = ox.features_from_place(place, {k: vals}).loc["way"]
-        elif polygon is not None:
-            features = ox.features_from_polygon(polygon, {k: vals}).loc["way"]
-        else:
-            raise ValueError("You should provide either `place` or `polygon`.")
+        try:
+            if place is not None:
+                features = ox.features_from_place(place, {k: vals}).loc["way"]
+            elif polygon is not None:
+                features = ox.features_from_polygon(polygon, {k: vals}).loc["way"]
+            else:
+                raise ValueError("You should provide either `place` or `polygon`.")
+        except ox._errors.InsufficientResponseError:
+            log.warning("Nothing to see here")
+            continue
 
         data.append(features)
 
     # Build a dataframe
-    edges = geopd.GeoDataFrame(pd.concat(data), geometry="geometry")
+    if len(data) > 0:
+        edges = geopd.GeoDataFrame(pd.concat(data), geometry="geometry")
+    else:
+        return geopd.GeoDataFrame([], geometry=[])
     edges.geometry = edges.geometry.line_merge()
     # Keep only `LineString` objects
     edges = (
