@@ -103,7 +103,11 @@ def osm_powerlines(
         )
     ]
     if len(edges) > 0:
-        edges.voltage = _clean_voltage(edges.voltage)
+        if "voltage" in edges.columns:
+            edges.voltage = _clean_voltage(edges.voltage)
+        else:
+            edges["voltage"] = pd.NA
+
         if voltage_fillvalue is None:
             edges = edges.dropna(subset="voltage")
             edges = edges[edges.voltage >= voltage_threshold]
@@ -118,14 +122,16 @@ def osm_powerlines(
         log.info("Retrieving substations from OpenStreetMap.")
         # Retrieve substations (additional nodes).
         # These substations are used to *merge* lines that do not touch.
-        substation_polygon = ops.transform(
-            MET2DEG, edges.to_crs(PRJ_MET).buffer(2 * substation_distance, resolution=2).union_all()
-        )
-        log.info("get nodes")
-        substations = retrieve_nodes(keys={"power": ["substation"]}, polygon=substation_polygon)
-        log.info("add substations fuzzily")
-        if len(substations) > 0:
-            edges = add_fuzzy_nodes(substations, edges, distance=substation_distance)
+        if len(edges) > 0:
+            substation_polygon = ops.transform(
+                MET2DEG,
+                edges.to_crs(PRJ_MET).buffer(2 * substation_distance, resolution=2).union_all(),
+            )
+            log.info("get nodes")
+            substations = retrieve_nodes(keys={"power": ["substation"]}, polygon=substation_polygon)
+            log.info("add substations fuzzily")
+            if len(substations) > 0:
+                edges = add_fuzzy_nodes(substations, edges, distance=substation_distance)
     log.info("Build graph")
     graph = Graph(
         edges=edges,
@@ -203,7 +209,7 @@ def retrieve_nodes(
                 _data = ox.features_from_polygon(polygon, tags)
             else:
                 raise ValueError("You should provide either `place` or `polygon`.")
-        except ox._errors.InsufficientResponseError:
+        except (ox._errors.InsufficientResponseError, shapely.errors.EmptyPartError):
             log.warning(f"No data for {tags}. Skipping")
             pass
         else:
@@ -325,8 +331,11 @@ class Graph:
             Same edges with columns `source_col` and `target_col` added
 
         """
-
         log.info("Extracting nodes from edges.")
+
+        if len(self.edges) == 0:
+            self.nodes = geopd.GeoDataFrame({"id": [], "geometry": []}, crs=self.edges.crs)
+            return self
         node_map: dict[geometry.base.BaseGeometry, str] = {}
         source_target: list[dict[str, int | Hashable]] = []
         for id, line in self.edges.geometry.items():
@@ -405,18 +414,87 @@ class Graph:
         g_outer = self.filter_edges(crossing_ids)
         return g_inner, g_outer
 
+    def merge_edges(self, other: Graph) -> Graph:
+        """Merge the edges of two `Graph` and adapt nodes accordingly.
+
+        1. find edges in self that covers edges in other
+        2. find edges in other that covers edges is self
+        3. remove them (identical edges should be taken only once)
+        4. rename the nodes.
+        """
+        all_nodes = pd.concat([self.nodes, other.nodes])
+        all_edges = pd.concat([self.edges, other.edges], ignore_index=True)
+        all_edge_sindex = shapely.STRtree(all_edges.geometry)
+
+        used = set()
+        keep_edges = set()
+        transform_edges = []
+        rename_nodes = {}
+
+        for edgeid, edge in all_edges.geometry.items():
+            if edgeid in used:
+                continue
+
+            # fetch all edges contained in this one
+            contains_idx = set(all_edge_sindex.query(edge, predicate="contains"))
+            involved = contains_idx - {edgeid}
+
+            if len(involved) > 0:
+                involved.add(edgeid)
+                used |= involved
+
+                involved_edges = all_edges.loc[list(involved)]
+                involved_nodes = all_nodes.loc[
+                    pd.concat([involved_edges.source, involved_edges.target])
+                ].rename(index=rename_nodes)
+                involved_nodes = involved_nodes.loc[~involved_nodes.index.duplicated()]
+                nodes = [sorted(n.index) for _, n in involved_nodes.groupby("geometry")]
+                new_renames = {nn: n[0] for n in nodes if len(n) > 1 for nn in n[1:]}
+                rename_nodes |= new_renames
+
+                # remove newly added renames
+                involved_nodes = involved_nodes.rename(index=new_renames)
+                involved_nodes = involved_nodes.loc[~involved_nodes.index.duplicated()]
+
+                # split the containing edge by the points
+                new_lines = align_line_points(edge, geopd.GeoDataFrame(involved_nodes))
+                for k, v in all_edges.loc[edgeid].items():
+                    if k not in {"geometry", "source", "target"}:
+                        new_lines[k] = v
+                transform_edges.append(new_lines)
+                keep_edges -= involved
+
+            else:
+                keep_edges.add(edgeid)
+
+        g = Graph(
+            edges=geopd.GeoDataFrame(
+                pd.concat([all_edges.iloc[list(keep_edges)]] + transform_edges), crs=self.edges.crs
+            ),
+            region=geopd.GeoDataFrame(pd.concat([self.region, other.region]), crs=self.region.crs),
+        )
+        g.edges.source = g.edges["source"].apply(lambda x: rename_nodes.get(x, x))
+        g.edges.target = g.edges["target"].apply(lambda x: rename_nodes.get(x, x))
+        all_nodes = all_nodes.rename(index=rename_nodes)
+        all_nodes = all_nodes[~all_nodes.index.duplicated()]
+
+        g.nodes = geopd.GeoDataFrame(all_nodes)
+        return g
+
     def merge(self, other: Graph) -> Graph:
         """Merge the two graphs.
 
         Merge edges that are crossing borders.
 
         Assumptions:
-            - No edges from the same source are overlapping (one covers the other, otherwise both are returned)
+            - No edges from the same source are overlapping (one covers the other, otherwise both are returned).
             - The overlapping part of an edge should be close to one extreme (the one in the other region)
               Otherwise the uncovered part is lost.
 
         See `osm_test.py` for examples.
         """
+        print(self.nodes)
+        print(other.nodes)
         # Edges in self, crossing to other.region
         g_inner1, g_outer1 = self.split_edges(other)
         g_inner2, g_outer2 = other.split_edges(self)
@@ -490,6 +568,9 @@ class Graph:
     def __str__(self) -> str:
         return "\n".join(map(str, [self.edges, self.nodes]))
 
+    def __len__(self) -> int:
+        return len(self.edges)
+
     @classmethod
     def read(cls, path: Path) -> Graph:
         edges = geopd.read_file(path, layer="edges")
@@ -523,6 +604,12 @@ class Graph:
                 text_args = {} if text_args is None else text_args
                 ax.annotate(name, (x, y), xytext=(x, y + 1), **text_args)
         ax.grid()
+
+
+def merge_lines(
+    lines: geopd.GeoDataFrame, nodes: geopd.GeoDataFrame
+) -> tuple[geometry.LineString, dict[str, str]]:
+    full_line = shapely.line_merge(shapely.union_all(lines.geometry))
 
 
 def _clean_voltage(voltage: pd.Series) -> pd.Series:
@@ -789,6 +876,24 @@ def sizeof_fmt(num, suffix: str = "iB", scale: float = 1024.0):
 def get_geolocation(place: str) -> geometry.Polygon | geometry.MultiPolygon:
     enclosing_polygon: geopd.GeoDataFrame = ox.geocoder.geocode_to_gdf(place)
     return enclosing_polygon.union_all()
+
+
+def align_line_points(line: geometry.LineString, points: geopd.GeoDataFrame) -> geopd.GeoDataFrame:
+    points["__dist__"] = [line.line_locate_point(p) for p in points.geometry]
+    points = points.sort_values(by="__dist__")
+    lines = geopd.GeoDataFrame(
+        [
+            {
+                "geometry": ops.substring(line, p1["__dist__"], p2["__dist__"]),
+                "source": p1name,
+                "target": p2name,
+            }
+            for (p1name, p1), (p2name, p2) in zip(
+                points.iloc[0:-1].iterrows(), points.iloc[1:].iterrows()
+            )
+        ]
+    )
+    return lines
 
 
 check_cache_size()
