@@ -7,28 +7,33 @@ to build a network from the infrastructures.
 from __future__ import annotations
 
 import logging
+from collections import namedtuple
 from collections.abc import Hashable
 from dataclasses import dataclass, field
+from itertools import product
 from numbers import Number
 from pathlib import Path
 from typing import Self
 
-import networkx as nx
 import geopandas as geopd
 import logconfig
+import networkx as nx
 import numpy as np
 import osmnx as ox
 import pandas as pd
 import pyproj
 import shapely
+import tqdm
 from matplotlib import axes
 from shapely import geometry, ops, plotting
+from sklearn import cluster
 
 CACHE = Path("~/.cache").expanduser() / "osm_retrieve_networks"
 CACHE.mkdir(parents=True, exist_ok=True)
 
-DATA = Path("../data")
+DATA = Path("~/curro/working_data/").expanduser() / "osm_retrieve_networks"
 DATA.mkdir(parents=True, exist_ok=True)
+
 PRJ_DEG = pyproj.CRS.from_epsg(4326)
 PRJ_MET = pyproj.CRS.from_epsg(3857)
 DEG2MET = pyproj.Transformer.from_crs(PRJ_DEG, PRJ_MET, always_xy=True).transform
@@ -36,8 +41,125 @@ MET2DEG = pyproj.Transformer.from_crs(PRJ_MET, PRJ_DEG, always_xy=True).transfor
 
 
 ox.settings.cache_folder = CACHE
-logconfig.setup_logging("DEBUG")
+logconfig.setup_logging("INFO")
 log = logging.getLogger(__name__)
+
+
+def osm_railways(
+    place: str | geometry.Polygon | geometry.MultiPolygon, node_prefix: str = ""
+) -> Graph:
+    """Retrieve the power-line network.
+
+    Parameters
+    ----------
+    place: str | geometry.Polygon | geometry.MultiPolygon
+        Retrieve data from this place: e.g. `Padova`, `London`, `France`… or a `[Multi]Polygon`.
+    node_prefix :  str
+        A prefix for the nodes.
+
+    Returns
+    -------
+    graph : Graph
+        nodes and edges
+    powerplants : GeoDataFrame
+        the powerplants
+    """
+    # Retrieving the enclosing poligon.
+    enclosing_polygon = get_geolocation(place=place) if isinstance(place, str) else place
+    if enclosing_polygon.area > 10:
+        log.warning(f"Area of size {enclosing_polygon.area}")
+    else:
+        log.info(f"Area of size {enclosing_polygon.area}")
+    # Retrieve lines from 'OpenStreetMap'.
+    log.info("Retrieving edges from OpenStreetMap.")
+    edges = retrieve_edges(
+        keys={"railway": ["rail", "construction", "preserved", "narrow_gauge"]},
+        polygon=enclosing_polygon,
+    )
+    print(edges.columns)
+    edges = edges[
+        [
+            "id",
+            "operator",
+            "ref",
+            "name",
+            "electrified",
+            "frequency",
+            "gauge",
+            "maxspeed",
+            "geometry",
+        ]
+    ]
+    if len(edges) > 0:
+        edges = split_edges_when_touching(edges)
+
+    # - add nodes as line boundaries
+    # - associate nodes to links
+    # - add nodes as stations
+    # - split links close to stations, re-associate nodes to links accordingly
+
+    # get train stations
+    nodes = retrieve_nodes({"railway": ["station", "halt", "stop"]}, polygon=enclosing_polygon)
+    nodes["id"] = [f"{node_prefix}{i}" for i in range(len(nodes))]
+    nodes = nodes.set_index("id", drop=True)
+    nodes["__keep__"] = True
+    print(edges)
+    edges = split_lines_at_points(nodes=nodes, edges=edges, max_distance=100)
+
+    # get nodes from edges
+    edgeBoundary_nodes = edges.boundary
+    edgeBoundary_nodes = geopd.GeoDataFrame(
+        {
+            "__keep__": False,
+            "id_s": [f"s{i}" for i in range(len(edgeBoundary_nodes))],
+            "id_t": [f"t{i}" for i in range(len(edgeBoundary_nodes))],
+            "geometry": edgeBoundary_nodes,
+        },
+        crs=edges.crs,
+    )
+    print("t411" in edgeBoundary_nodes["id_t"])
+
+    # assign source and target to edges.
+    edges["source"] = edges["source"].fillna(edgeBoundary_nodes["id_s"])
+    edges["target"] = edges["target"].fillna(edgeBoundary_nodes["id_t"])
+    print(edges)
+    print("t411" in edges["target"])
+    print("t411" in edgeBoundary_nodes["id_t"])
+    edgeBoundary_nodes = geopd.GeoDataFrame(
+        pd.concat(
+            [
+                edgeBoundary_nodes.explode().iloc[::2].set_index("id_s", drop=True),
+                edgeBoundary_nodes.explode().iloc[1::2].set_index("id_t", drop=True),
+            ]
+        )
+    )
+    print(edgeBoundary_nodes)
+    print("t411" in edgeBoundary_nodes.index)
+    nodes = geopd.GeoDataFrame(
+        pd.concat([nodes, edgeBoundary_nodes]), geometry="geometry", crs=nodes.crs
+    )
+    print("t411" in nodes.index)
+    nodes = nodes.loc[list(set(edges.source.tolist() + edges.target.tolist()))]
+    print(nodes)
+    print(edges)
+    edges.to_file("/tmp/pippo.geojson")
+    nodes.to_file("/tmp/pippo2.geojson")
+
+    exit()
+    edges = project_edges_to_nodes(
+        edges.to_crs(PRJ_MET), nodes.to_crs(PRJ_MET), max_distance=500
+    ).to_crs(PRJ_DEG)
+
+    graph = Graph(
+        edges=edges,
+        region=geopd.GeoDataFrame([{"region": 0}], geometry=[enclosing_polygon], crs=PRJ_DEG),
+    )
+    log.info("Get nodes from edges extremes.")
+    graph.nodes = nodes
+    #
+    # log.info("Get power plants.")
+
+    return graph
 
 
 def osm_powerlines(
@@ -47,16 +169,18 @@ def osm_powerlines(
     voltage_threshold: float = 1000,
     node_prefix: str = "",
 ) -> tuple[Graph, geopd.GeoDataFrame]:
-    """Retrieve the powerline network.
+    """Retrieve the power-line network.
 
     Parameters
     ----------
-    place: str
-        Retrieve data from this place: e.g. `Padova`, `London`, `France`…
+    place: str | geometry.Polygon | geometry.MultiPolygon
+        Retrieve data from this place: e.g. `Padova`, `London`, `France`… or a `[Multi]Polygon`.
     voltage_fillvalue : float | None :
          (Default value = None)
     voltage_threshold : float
         (Default value = 1000)
+    node_prefix :  str
+        A prefix for the nodes.
 
     Returns
     -------
@@ -117,7 +241,7 @@ def osm_powerlines(
             # This is risky as the network is not that accurately reported.
             edges.voltage = edges.voltage.fillna(voltage_fillvalue)
             log.warning("You assume that edges with no voltage are below 69k.")
-        edges = join_edges_at_points(edges.reset_index(drop=False))
+        edges = split_edges_when_touching(edges.reset_index(drop=False))
 
         log.info("Retrieving substations from OpenStreetMap.")
         # Retrieve substations (additional nodes).
@@ -131,6 +255,7 @@ def osm_powerlines(
             substations = retrieve_nodes(keys={"power": ["substation"]}, polygon=substation_polygon)
             log.info("add substations fuzzily")
             if len(substations) > 0:
+                substations = cluster_points(substations, distance=substation_distance)
                 edges = add_fuzzy_nodes(substations, edges, distance=substation_distance)
     log.info("Build graph")
     graph = Graph(
@@ -390,7 +515,7 @@ class Graph:
         - For one edge covering the other: return smaller
         - For one edge present in only one graph: return it
         """
-        sindex = shapely.strtree.STRtree(other.edges.geometry)
+        sindex = shapely.STRtree(other.edges.geometry)
         edges = {
             id: set(sindex.query(edge.geometry, predicate="within"))
             for id, edge in self.edges.iterrows()
@@ -407,7 +532,7 @@ class Graph:
     def split_edges(self, other):
         """Split edges in those intersecting the other.region and the others."""
         # Edges in self, crossing to other.region
-        sindex = shapely.strtree.STRtree(self.edges.geometry)
+        sindex = shapely.STRtree(self.edges.geometry)
         crossing_ids = self.edges.index[sindex.query(other.region_shape, predicate="intersects")]
 
         g_inner = self.filter_edges(self.index().difference(list(crossing_ids)))
@@ -466,6 +591,19 @@ class Graph:
 
             else:
                 keep_edges.add(edgeid)
+
+        # Almost overlapping nodes:
+        sindex = shapely.STRtree(self.nodes.geometry)
+        rename_overlapping_nodes = {
+            id_node: self.nodes.index[sindex.query_nearest(node, max_distance=1e-6)]
+            for id_node, node in other.nodes.geometry.items()
+        }
+        rename_overlapping_nodes = {
+            k: v[0] for k, v in rename_overlapping_nodes.items() if len(v) > 0
+        }
+        print(rename_nodes)
+        print(rename_overlapping_nodes)
+        rename_nodes |= rename_overlapping_nodes
 
         g = Graph(
             edges=geopd.GeoDataFrame(
@@ -606,12 +744,6 @@ class Graph:
         ax.grid()
 
 
-def merge_lines(
-    lines: geopd.GeoDataFrame, nodes: geopd.GeoDataFrame
-) -> tuple[geometry.LineString, dict[str, str]]:
-    full_line = shapely.line_merge(shapely.union_all(lines.geometry))
-
-
 def _clean_voltage(voltage: pd.Series) -> pd.Series:
     """Clean the voltage column."""
 
@@ -630,43 +762,197 @@ def _clean_voltage(voltage: pd.Series) -> pd.Series:
     return voltage.apply(_convert)
 
 
-def merge_points_within_distance(points: geopd.GeoDataFrame, distance: float) -> geopd.GeoDataFrame:
-    """Merge (centroid) nodes that falls within `distance`.
+def project_edges_to_nodes(
+    edges: geopd.GeoDataFrame, nodes: geopd.GeoDataFrame, max_distance: float
+) -> geopd.GeoDataFrame:
+    """Change the edges to link the new set of nodes.
 
-    `distance` must be in the same coordinate system.
+    Use the shortest path to link nodes.
+    """
+    e_sindex = shapely.STRtree(edges.geometry)
+    edgelist = e_sindex.query(edges.geometry, predicate="intersects")
+    network = nx.from_edgelist([(e1, e2) for e1, e2 in edgelist.T if e1 != e2])
+    print(network)
+
+    nodes_to_edges = e_sindex.query(nodes.geometry, predicate="dwithin", distance=500)
+    n2e = {}
+    for e, n in nodes_to_edges.T:
+        n2e.setdefault(n, []).append(e)
+
+    print("TODO")
+    exit()
+    for node_i, node_j in product(range(len(nodes)), repeat=2):
+        if node_i == node_j:
+            continue
+        # find shortest path between closest edges.
+        lines = [nx.shortest_path(network, l1, l2, weight=1)]
+    return edges
+
+
+def split_lines_at_points(
+    nodes: geopd.GeoDataFrame, edges: geopd.GeoDataFrame, max_distance: float = 0.0
+) -> geopd.GeoDataFrame:
+    """Split lines which fall close to the given nodes.
+
+    Move points to the line.
+
+    Only the closed points to each extreme are taken in consideration.
+    Example: Powerlines getting close to substations.
 
     Parameters
     ----------
-    points : geopd.GeoDataFrame
-        A dataframe of points.
+    nodes : geopd.GeoDataFrame
+        The nodes dataframe.
+    edges : geopd.GeoDataFrame
+        The edges dataframe.
     distance : float
-        The threshold distance (same units of the points projection)
+         (Default value = 0.0)
+         The distance up to which edges should be connected to the a node
 
     Returns
     -------
-    points : GeoDataFrame
-        A dataframe with close points merged.
+    edges : GeoDataFrame
+        The edges connected to the points within `distance`
 
     """
-    log.info(f"Merging nodes within {distance} distance.")
-    sindex = points.sindex
-    points["label"] = [
-        min(sindex.query(point, predicate="dwithin", distance=distance))
-        for point in points.geometry
-    ]
-    points = points.reset_index(drop=False)
-    return geopd.GeoDataFrame(
-        points.groupby(by="label")
-        .aggregate(
-            func={
-                "name": "first",
-                "geometry": lambda x: geometry.MultiPoint(x).centroid,
-                "id": "first",
-            }
-        )
-        .set_index("id", drop=True),
-        crs=points.crs,
+    if "name" not in nodes.columns:
+        nodes["name"] = range(len(nodes))
+    if "name" not in edges.columns:
+        edges["name"] = range(len(edges))
+    mnodes = nodes.copy().to_crs(PRJ_MET)
+    medges = edges.copy().to_crs(PRJ_MET)
+
+    # Use `sindex` for quickness
+    edges_sindex = shapely.STRtree(medges.geometry)
+    Cache = namedtuple(
+        "Cache", field_names=["toremove", "newedges", "usednodes"], defaults=[[], [], []]
     )
+
+    cache = Cache()
+    for id, mnode in mnodes.geometry.items():
+        # closest node to source
+        i_edges = edges_sindex.query_nearest(mnode, max_distance=max_distance, all_matches=False)
+
+        if len(i_edges) > 0:
+            # if there is some edges within distance, it should be just one.
+            ied = i_edges[0]
+
+            # if this edge has already be used,
+            # skip it. We will check it next iteration
+            if ied in cache.toremove:
+                continue
+
+            old_edge = medges.iloc[ied]
+            new_edge1 = old_edge.to_dict()
+            new_edge2 = old_edge.to_dict()
+
+            # split in the closest point
+            node_pos = old_edge.geometry.project(mnode)
+            if node_pos <= 0:
+                cache.toremove.append(ied)
+                new_edge1["source"] = id
+                cache.newedges.append(new_edge1)
+                cache.usednodes.append(id)
+            elif node_pos >= old_edge.geometry.length:
+                cache.toremove.append(ied)
+                new_edge1["target"] = id
+                cache.newedges.append(new_edge1)
+                cache.usednodes.append(id)
+
+            new_edge1["geometry"] = ops.substring(old_edge.geometry, 0, node_pos)
+            new_edge1["target"] = id
+            new_edge2["geometry"] = ops.substring(
+                old_edge.geometry, node_pos, old_edge.geometry.length
+            )
+            new_edge2["source"] = id
+
+            cache.toremove.append(ied)
+            cache.newedges.extend([new_edge1, new_edge2])
+            cache.usednodes.append(id)
+
+    # Substitute with the updated geometries
+
+    _edges = geopd.GeoDataFrame(
+        pd.concat(
+            [medges.drop(index=cache.toremove), pd.DataFrame(cache.newedges)], ignore_index=True
+        )
+    ).set_crs(PRJ_MET, allow_override=True)
+    if len(cache.toremove) > 0:
+        _edges = split_lines_at_points(
+            nodes=nodes.drop(index=cache.usednodes), edges=_edges, max_distance=max_distance
+        )
+    return _edges.to_crs(PRJ_DEG)
+
+
+def extend_line_to_point(
+    nodes: geopd.GeoDataFrame, edges: geopd.GeoDataFrame, max_distance: float = 0.0
+) -> geopd.GeoDataFrame:
+    """Split lines which fall close to the given nodes.
+
+    Only the closed points to each extreme are taken in consideration.
+    Example: Powerlines getting close to substations.
+
+    Parameters
+    ----------
+    nodes : geopd.GeoDataFrame
+        The nodes dataframe.
+    edges : geopd.GeoDataFrame
+        The edges dataframe.
+    distance : float
+         (Default value = 0.0)
+         The distance up to which edges should be connected to the a node
+
+    Returns
+    -------
+    edges : GeoDataFrame
+        The edges connected to the points within `distance`
+
+    """
+    if "name" not in nodes.columns:
+        nodes["name"] = range(len(nodes))
+    if "name" not in edges.columns:
+        edges["name"] = range(len(edges))
+    mnodes = nodes[["name", "geometry"]].copy().to_crs(PRJ_MET)
+    medges = edges[["name", "geometry"]].copy().to_crs(PRJ_MET)
+
+    # Use `sindex` for quickness
+    nodes_sindex = shapely.STRtree(mnodes.geometry)
+    update = {}
+    for id, medge in medges.geometry.items():
+        try:
+            source, target = medge.boundary.geoms
+        except ValueError:
+            # Circular lines!!!!
+            continue
+
+        # closest node to source
+        imes = nodes_sindex.query_nearest(source, max_distance=max_distance, all_matches=False)
+        # closest node to target
+        imet = nodes_sindex.query_nearest(target, max_distance=max_distance, all_matches=False)
+
+        ids = np.concat([imes, imet])
+        assert len(ids) <= 2
+
+        # If both ends of the edge fall close to the same point,
+        # remove that edge
+        if len(ids) == 2 and ids[0] == ids[1]:
+            continue
+
+        if len(ids) > 0 and isinstance(medge, geometry.LineString):
+            update[id] = _join_line_point_buffered(
+                medge,
+                geopd.GeoSeries(mnodes.geometry.iloc[ids], index=mnodes.index[ids]),
+                max_distance,
+            )
+            continue
+
+        update[id] = medge
+
+    # Substitute with the updated geometries
+    _update = geopd.GeoSeries(update, crs=mnodes.crs).dropna().to_crs(edges.crs)
+    edges = edges.loc[_update.index]
+    edges.geometry = _update.geometry
+    return edges
 
 
 def add_fuzzy_nodes(
@@ -700,21 +986,20 @@ def add_fuzzy_nodes(
     mnodes = nodes[["name", "geometry"]].copy().to_crs(PRJ_MET)
     medges = edges[["name", "geometry"]].copy().to_crs(PRJ_MET)
 
-    # Merge all points that are closer than `distance`
-    mnodes = merge_points_within_distance(mnodes, distance)
-
     # Use `sindex` for quickness
-    nodes_sindex = shapely.strtree.STRtree(mnodes.geometry)
+    nodes_sindex = shapely.STRtree(mnodes.geometry)
     update = {}
     for id, medge in medges.geometry.items():
         try:
-            source, targert = medge.boundary.geoms
+            source, target = medge.boundary.geoms
         except ValueError:
             # Circular lines!!!!
             continue
 
+        # closest node to source
         imes = nodes_sindex.query_nearest(source, max_distance=distance, all_matches=False)
-        imet = nodes_sindex.query_nearest(targert, max_distance=distance, all_matches=False)
+        # closest node to target
+        imet = nodes_sindex.query_nearest(target, max_distance=distance, all_matches=False)
 
         ids = np.concat([imes, imet])
         assert len(ids) <= 2
@@ -731,13 +1016,30 @@ def add_fuzzy_nodes(
             continue
 
         update[id] = medge
-        continue
 
     # Substitute with the updated geometries
     _update = geopd.GeoSeries(update, crs=mnodes.crs).dropna().to_crs(edges.crs)
     edges = edges.loc[_update.index]
     edges.geometry = _update.geometry
     return edges
+
+
+def cluster_points(
+    points: geopd.GeoDataFrame, distance: float = 100, column: str = "__node_clusters__"
+) -> geopd.GeoDataFrame:
+    """Cluster nodes that are within `distance` (meters). Based on the `DBSCAN`.
+
+    This adds a column to the `GeoDataFrame` with the labels of each cluster.
+    """
+    data_in_meters = points.geometry.to_crs(PRJ_MET)
+    labels = cluster.DBSCAN(eps=distance, min_samples=2).fit_predict(
+        [[p.x, p.y] for p in data_in_meters]
+    )
+    solitons = labels == 1
+    maxlabels = labels.max()
+    labels[solitons] = np.arange(sum(solitons)) + (maxlabels + 1)
+    points[column] = labels
+    return points.dissolve(by=column, aggfunc="first").reset_index(drop=True)
 
 
 def _join_line_point_buffered(
@@ -785,7 +1087,7 @@ def _join_line_point_buffered(
     return _line
 
 
-def join_edges_at_points(edges: geopd.GeoDataFrame) -> geopd.GeoDataFrame:
+def split_edges_when_touching(edges: geopd.GeoDataFrame) -> geopd.GeoDataFrame:
     """Joins edges at their intersection.
 
     If the extreme of an edge touches the another edge, the latter is splitted in that point
@@ -811,7 +1113,7 @@ def join_edges_at_points(edges: geopd.GeoDataFrame) -> geopd.GeoDataFrame:
             continue
 
         # Find close-by edges (only with higher index to consider only one direction)
-        possible = [edges.index[i] for i in sindex.intersection(edge1.bounds)]
+        possible = [edges.index[int(i)] for i in sindex.intersection(edge1.bounds)]
         # Remove self
         possible = [id for id in possible if id != edge_id1]
         # Remove already chopped
@@ -824,7 +1126,7 @@ def join_edges_at_points(edges: geopd.GeoDataFrame) -> geopd.GeoDataFrame:
             continue
 
         # Split edge in shorter edges at intersections.
-        edges_touch = geometry.MultiLineString(lines=edges.geometry.loc[touches].tolist())
+        edges_touch = shapely.MultiLineString(lines=edges.geometry.loc[touches].tolist())
         edge_splitted = ops.split(edge1, edges_touch)  # MultiLineString
         if len(edge_splitted.geoms) > 1:
             new_edges.setdefault(edge_id1, []).extend(edge_splitted.geoms)
@@ -853,7 +1155,7 @@ def join_edges_at_points(edges: geopd.GeoDataFrame) -> geopd.GeoDataFrame:
     if len(new_edges) == 0:
         return result
     log.info("Performing a new deeper recursive level")
-    return join_edges_at_points(result)
+    return split_edges_when_touching(result)
 
 
 def check_cache_size():
@@ -894,6 +1196,79 @@ def align_line_points(line: geometry.LineString, points: geopd.GeoDataFrame) -> 
         ]
     )
     return lines
+
+
+def load_regions(buffer_size: float | None = None, test: bool | None = None) -> geopd.GeoDataFrame:
+    """Load the countries (and regions) with an optional buffer.
+
+    For now Europe.
+    """
+    fn = "../data/prov_test.geojson" if test else "../data/regions_europe.geojson"
+    regions = geopd.read_file(fn).rename(columns={"index": "code"})[["code", "geometry"]]
+
+    if buffer_size is None or buffer_size <= 0.0:
+        return regions
+
+    reg_buffer = buffer(regions, buf_size=buffer_size)
+    reg_buffer = split_cells(reg_buffer, cell_size=buffer_size)
+    regions = geopd.GeoDataFrame(pd.concat([regions, reg_buffer]))
+
+    return regions
+
+
+def split_cells(areas: geopd.GeoDataFrame, cell_size: float = 2.0) -> geopd.GeoDataFrame:
+    """Split large polygons in smaller cells."""
+
+    bounds = areas.geometry.total_bounds
+    nx = int((bounds[2] - bounds[0]) / cell_size) + 1
+    ny = int((bounds[3] - bounds[1]) / cell_size) + 1
+
+    xes = np.linspace(bounds[0], bounds[2], nx)
+    yes = np.linspace(bounds[1], bounds[3], ny)
+
+    tiles = geopd.GeoDataFrame(
+        [
+            {"geometry": shapely.box(x1, y1, x2, y2)}
+            for x1, x2 in zip(xes, xes[1:])
+            for y1, y2 in zip(yes, yes[1:])
+        ]
+    )
+
+    tiles["code"] = [f"BUFFER_{i:04d}" for i in tiles.index]
+    tiles.geometry = tiles.intersection(areas.union_all(grid_size=0.01))
+    # keep only the overlapping areas
+    tiles = tiles[tiles.area > 0]
+
+    return tiles
+
+
+def buffer(data: geopd.GeoDataFrame, buf_size: float = 2.0) -> geopd.GeoDataFrame:
+    """Create a buffer around a `GeoDataFrame`."""
+    cache = Path("../data/regions_europe_buffer.geojson")
+
+    if cache.is_file():
+        return geopd.read_file(cache)
+
+    buf = None
+    for country in tqdm.tqdm(data.geometry):
+        if buf is None:
+            buf = country.buffer(buf_size)
+        else:
+            buf = buf.union(country.buffer(buf_size), grid_size=0.01)
+
+    if buf is not None:
+        buffer = geopd.GeoDataFrame(
+            [{"region": "EU"}],
+            geometry=[shapely.difference(buf, data.union_all(), grid_size=0.01)],
+            crs=4326,
+        )
+
+    else:
+        buffer = geopd.GeoDataFrame([], geometry=[])
+
+    # cache it
+    buffer.to_file(cache)
+    return buffer
 
 
 check_cache_size()

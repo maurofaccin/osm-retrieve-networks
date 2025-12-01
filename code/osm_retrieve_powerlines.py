@@ -4,42 +4,16 @@ import geopandas as geopd
 import osm
 import pandas as pd
 import shapely
-import tqdm
-import numpy as np
 
-datapath = Path("../data/graphs")
+datapath = osm.DATA / Path("graphs_powerlines_EU")
 datapath.mkdir(parents=True, exist_ok=True)
 
 osm.logconfig.setup_logging("INFO")
 
 
-def retrieve_countries() -> None:
-    countries = load_countries()
-    _retrieve(countries)
-
-
-def retrieve_buffer() -> None:
-    buffer = get_buffer_region(buf_size=2.0)
-
-    bounds = buffer.iloc[0].geometry.bounds
-    nx = int(bounds[2] - bounds[0]) // 2 + 2
-    ny = int(bounds[3] - bounds[1]) // 2 + 2
-
-    xes = np.linspace(bounds[0], bounds[2], nx)
-    yes = np.linspace(bounds[1], bounds[3], ny)
-
-    tiles = geopd.GeoDataFrame(
-        [
-            {"geometry": shapely.box(x1, y1, x2, y2)}
-            for x1, x2 in zip(xes, xes[1:])
-            for y1, y2 in zip(yes, yes[1:])
-        ]
-    )
-    tiles["code"] = [f"BUFFER_{i:04d}" for i in tiles.index]
-    tiles.geometry = tiles.intersection(buffer.iloc[0].geometry)
-    # keep only the overlapping areas
-    tiles = tiles[tiles.area > 0]
-    _retrieve(tiles)
+def retrieve():
+    regions = osm.load_regions(buffer_size=2.0)
+    _retrieve(regions)
 
 
 def _retrieve(data: pd.DataFrame) -> None:
@@ -73,6 +47,7 @@ def merge() -> None:
         osm.log.info(pp_path)
 
         pl = osm.Graph.read(pl_path)
+        pl = fix_edges(pl, pl_path)
         pp = geopd.read_file(pp_path)
 
         if len(pl) == 0:
@@ -91,16 +66,57 @@ def merge() -> None:
                 pd.concat([powerplants, pp], ignore_index=True), crs=powerplants.crs
             )
 
+    if graph is not None:
         graph.write(datapath / "graph_all_graph.gpkg")
+    if powerplants is not None:
         powerplants.to_file(datapath / "graph_all_powerplants.geojson")
+
+
+def fix_edges(graph: osm.Graph, path: Path) -> osm.Graph:
+    if "ITA.14" in path.name:
+        new_edges = [("ITA.14_1_152", "ITA.14_1_4")]
+        for n1, n2 in new_edges:
+            assert n1 in graph.nodes.index
+            assert n2 in graph.nodes.index
+        graph.edges = geopd.GeoDataFrame(
+            pd.concat(
+                [
+                    graph.edges,
+                    geopd.GeoDataFrame(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "power": "cable",
+                                    "voltage": 500000,
+                                    "source": source,
+                                    "target": target,
+                                    "geometry": shapely.LineString(
+                                        [
+                                            graph.nodes.loc[source, "geometry"],
+                                            graph.nodes.loc[target, "geometry"],
+                                        ]
+                                    ),
+                                }
+                                for source, target in new_edges
+                            ]
+                        ),
+                        crs=graph.edges.crs,
+                    ),
+                ]
+            ),
+            crs=graph.edges.crs,
+        )
+
+    return graph
 
 
 def test_merge():
     graph: osm.Graph | None = None
     powerplants: geopd.GeoDataFrame | None = None
     for pl_path in [
-        "../data/graphs/graph_RUS.44_1_graph.gpkg",
-        "../data/graphs/graph_RUS.72_1_graph.gpkg",
+        "../data/graphs/graph_FRA.5_1_graph.gpkg",
+        "../data/graphs/graph_ITA.14_1_graph.gpkg",
+        "../data/graphs/graph_BUFFER_0594_graph.gpkg",
     ]:
         pl_path = Path(pl_path)
         pp_path = datapath / pl_path.name.replace("_graph.gpkg", "_powerplants.geojson")
@@ -108,7 +124,7 @@ def test_merge():
         osm.log.info(pp_path)
 
         pl = osm.Graph.read(pl_path)
-        print("ESP.12_1_2" in pl.nodes.index)
+        pl = fix_edges(pl, pl_path)
         pp = geopd.read_file(pp_path)
 
         if len(pl) == 0:
@@ -127,47 +143,13 @@ def test_merge():
                 pd.concat([powerplants, pp], ignore_index=True), crs=powerplants.crs
             )
 
-        # graph.write(Path("/tmp/graph_all_graph.gpkg"))
-        # powerplants.to_file(Path("/tmp/graph_all_powerplants.geojson"))
-
-
-def get_buffer_region(buf_size: float = 2.0) -> geopd.GeoDataFrame:
-    cache = Path("../data/regions_europe_buffer.geojson")
-
-    if cache.is_file():
-        return geopd.read_file(cache)
-
-    countries = load_countries()
-    buf = None
-    for country in tqdm.tqdm(countries.geometry):
-        if buf is None:
-            buf = country.buffer(buf_size)
-        else:
-            buf = buf.union(country.buffer(buf_size), grid_size=0.01)
-
-    if buf is not None:
-        buffer = geopd.GeoDataFrame(
-            [{"region": "EU"}],
-            geometry=[shapely.difference(buf, countries.union_all(), grid_size=0.01)],
-            crs=4326,
-        )
-
-    else:
-        buffer = geopd.GeoDataFrame([], geometry=[])
-
-    # cache it
-    buffer.to_file(cache)
-    return buffer
-
-
-def load_countries() -> geopd.GeoDataFrame:
-    return geopd.read_file("../data/regions_europe.geojson").rename(columns={"index": "code"})[
-        ["code", "geometry"]
-    ]
+    if graph is not None:
+        graph.write(Path("/tmp/graph_all_graph.gpkg"))
+    if powerplants is not None:
+        powerplants.to_file(Path("/tmp/graph_all_powerplants.geojson"))
 
 
 if __name__ == "__main__":
-    # retrieve_buffer()
-    # retrieve_countries()
+    # retrieve()
     merge()
     # test_merge()
