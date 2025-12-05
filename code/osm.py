@@ -8,12 +8,11 @@ from __future__ import annotations
 
 import logging
 from collections import namedtuple
-from collections.abc import Hashable
 from dataclasses import dataclass, field
-from itertools import product
+from itertools import combinations, product
 from numbers import Number
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 import geopandas as geopd
 import logconfig
@@ -25,6 +24,7 @@ import pyproj
 import shapely
 import tqdm
 from matplotlib import axes
+from networkx import exception as nxexc
 from shapely import geometry, ops, plotting
 from sklearn import cluster
 
@@ -76,7 +76,110 @@ def osm_railways(
         keys={"railway": ["rail", "construction", "preserved", "narrow_gauge"]},
         polygon=enclosing_polygon,
     )
-    print(edges.columns)
+    edges.data = edges.data[
+        [
+            "id",
+            "operator",
+            "ref",
+            "name",
+            "electrified",
+            "frequency",
+            "gauge",
+            "maxspeed",
+            "geometry",
+        ]
+    ]
+    if len(edges) > 0:
+        edges.split_edges_when_touching()
+
+    # get train stations
+    log.info("Getting stations from OpenStreetMap.")
+    nodes = retrieve_nodes({"railway": ["station", "halt", "stop"]}, polygon=enclosing_polygon)
+    nodes.data = nodes.data[
+        ["geometry", "name", "public_transport", "railway", "operator", "network", "wheelchair"]
+    ]
+    nodes.data["id"] = [f"{node_prefix}{i}" for i in range(len(nodes))]
+    nodes.data = nodes.data.set_index("id", drop=True)
+    nodes.data["__keep__"] = True
+
+    # get nodes from edges and assigne source and target columns accordingly
+    edgeBoundary_nodes = edges.nodes_from_boundaries(
+        prefix="__tmp_node_", source_col="source", target_col="target"
+    )
+    edgeBoundary_nodes.data["__keep__"] = False
+    edgeBoundary_nodes.data.loc[
+        ~edgeBoundary_nodes.data.geometry.intersects(enclosing_polygon), "__keep__"
+    ] = True
+
+    # split lines passing through stations.
+    # edges = split_lines_at_points(
+    #     nodes=nodes, edges=edges, max_distance=100, max_distance_bounds=10
+    # )
+    edges = edges.to_meters()
+    nodes = nodes.to_meters()
+    edges.add_nodes(nodes, max_distance=300, max_distance_bounds=10)
+
+    # Join temp and real nodes.
+    nodes = nodes.append(edgeBoundary_nodes.to_meters())
+
+    # Clean from unused nodes.
+    nodes.data = nodes.data.loc[list(set(edges.source.tolist() + edges.target.tolist()))]
+
+    # Clean form self loops.
+    edges = edges.remove_self_loops()
+    edges = edges.drop_duplicates_edges()
+    edges.data.to_file(f"/tmp/edges_{node_prefix}.geojson")
+    nodes.data.to_file(f"/tmp/nodes_{node_prefix}.geojson")
+
+    g = graph_from_shortest_path(edges, nodes, grouping_distance=500)
+    edges = Edges(g[0])
+    nodes = Edges(g[1])
+
+    edges = edges.to_degree()
+    nodes = nodes.to_degree()
+    graph = Graph(
+        edges=edges.data,
+        region=geopd.GeoDataFrame([{"region": 0}], geometry=[enclosing_polygon], crs=PRJ_DEG),
+    )
+    log.info("Get nodes from edges extremes.")
+    graph.nodes = nodes.data.representative_point()
+    #
+    # log.info("Get power plants.")
+
+    return graph
+
+
+def osm_railways_old(
+    place: str | geometry.Polygon | geometry.MultiPolygon, node_prefix: str = ""
+) -> Graph:
+    """Retrieve the power-line network.
+
+    Parameters
+    ----------
+    place: str | geometry.Polygon | geometry.MultiPolygon
+        Retrieve data from this place: e.g. `Padova`, `London`, `France`… or a `[Multi]Polygon`.
+    node_prefix :  str
+        A prefix for the nodes.
+
+    Returns
+    -------
+    graph : Graph
+        nodes and edges
+    powerplants : GeoDataFrame
+        the powerplants
+    """
+    # Retrieving the enclosing poligon.
+    enclosing_polygon = get_geolocation(place=place) if isinstance(place, str) else place
+    if enclosing_polygon.area > 10:
+        log.warning(f"Area of size {enclosing_polygon.area}")
+    else:
+        log.info(f"Area of size {enclosing_polygon.area}")
+    # Retrieve lines from 'OpenStreetMap'.
+    log.info("Retrieving edges from OpenStreetMap.")
+    edges = retrieve_edges(
+        keys={"railway": ["rail", "construction", "preserved", "narrow_gauge"]},
+        polygon=enclosing_polygon,
+    )
     edges = edges[
         [
             "id",
@@ -99,52 +202,49 @@ def osm_railways(
     # - split links close to stations, re-associate nodes to links accordingly
 
     # get train stations
+    log.info("Getting stations from OpenStreetMap.")
     nodes = retrieve_nodes({"railway": ["station", "halt", "stop"]}, polygon=enclosing_polygon)
+    nodes = nodes[
+        [
+            "geometry",
+            "name",
+            "public_transport",
+            "railway",
+            "ref",
+            "operator",
+            "network",
+            "wheelchair",
+        ]
+    ]
     nodes["id"] = [f"{node_prefix}{i}" for i in range(len(nodes))]
     nodes = nodes.set_index("id", drop=True)
     nodes["__keep__"] = True
-    print(edges)
-    edges = split_lines_at_points(nodes=nodes, edges=edges, max_distance=100)
 
     # get nodes from edges
-    edgeBoundary_nodes = edges.boundary
-    edgeBoundary_nodes = geopd.GeoDataFrame(
-        {
-            "__keep__": False,
-            "id_s": [f"s{i}" for i in range(len(edgeBoundary_nodes))],
-            "id_t": [f"t{i}" for i in range(len(edgeBoundary_nodes))],
-            "geometry": edgeBoundary_nodes,
-        },
-        crs=edges.crs,
-    )
-    print("t411" in edgeBoundary_nodes["id_t"])
+    edgeBoundary_nodes, source_target = nodes_from_edges(edges, prefix="__tmp_node_")
+    edgeBoundary_nodes["__keep__"] = False
 
     # assign source and target to edges.
-    edges["source"] = edges["source"].fillna(edgeBoundary_nodes["id_s"])
-    edges["target"] = edges["target"].fillna(edgeBoundary_nodes["id_t"])
-    print(edges)
-    print("t411" in edges["target"])
-    print("t411" in edgeBoundary_nodes["id_t"])
-    edgeBoundary_nodes = geopd.GeoDataFrame(
-        pd.concat(
-            [
-                edgeBoundary_nodes.explode().iloc[::2].set_index("id_s", drop=True),
-                edgeBoundary_nodes.explode().iloc[1::2].set_index("id_t", drop=True),
-            ]
-        )
+    edges["source"] = source_target["source"]
+    edges["target"] = source_target["target"]
+
+    # split lines passing through stations.
+    edges = split_lines_at_points(
+        nodes=nodes, edges=edges, max_distance=100, max_distance_bounds=10
     )
-    print(edgeBoundary_nodes)
-    print("t411" in edgeBoundary_nodes.index)
+
+    # Join temp and real nodes.
     nodes = geopd.GeoDataFrame(
         pd.concat([nodes, edgeBoundary_nodes]), geometry="geometry", crs=nodes.crs
     )
-    print("t411" in nodes.index)
+
+    # Clean from unused nodes.
     nodes = nodes.loc[list(set(edges.source.tolist() + edges.target.tolist()))]
-    print(nodes)
-    print(edges)
+
     edges.to_file("/tmp/pippo.geojson")
     nodes.to_file("/tmp/pippo2.geojson")
 
+    graph_from_shortest_path(edges, nodes, grouping_distance=150)
     exit()
     edges = project_edges_to_nodes(
         edges.to_crs(PRJ_MET), nodes.to_crs(PRJ_MET), max_distance=500
@@ -160,6 +260,15 @@ def osm_railways(
     # log.info("Get power plants.")
 
     return graph
+
+
+def mode(data: list):
+    """Return the mode or a random entry."""
+    data = pd.Series(data).dropna()
+    if len(data) == 0:
+        return None
+
+    return pd.Series(data).value_counts().sort_values().index[-1]
 
 
 def osm_powerlines(
@@ -301,7 +410,7 @@ def retrieve_nodes(
     keys: dict,
     place: str | None = None,
     polygon: geometry.Polygon | geometry.MultiPolygon | None = None,
-) -> geopd.GeoDataFrame:
+) -> Nodes:
     """Retrieve node data from OpenStreetMap.
 
     Use this to download data that should be points.
@@ -345,7 +454,7 @@ def retrieve_nodes(
 
     # Build a `DataFrame`
     if len(data) == 0:
-        return geopd.GeoDataFrame([], geometry=[], crs=PRJ_DEG)
+        return Nodes(geopd.GeoDataFrame([], geometry=[], crs=PRJ_DEG))
     nodes = geopd.GeoDataFrame(pd.concat(data), geometry="geometry", crs=PRJ_DEG).droplevel(0)
     nodes.columns = [c.replace(":", "_") for c in nodes.columns]
     nodes = nodes.dropna(how="all", axis=1)
@@ -353,14 +462,14 @@ def retrieve_nodes(
     # Transform everything to nodes
     nodes.geometry = nodes.geometry.representative_point()
     # Drop duplicates
-    return nodes.loc[~nodes.index.duplicated(keep="first"), :]
+    return Nodes(nodes.loc[~nodes.index.duplicated(keep="first"), :])
 
 
 def retrieve_edges(
     keys: dict,
     place: str | None = None,
     polygon: geometry.Polygon | geometry.MultiPolygon | None = None,
-) -> geopd.GeoDataFrame:
+) -> Edges:
     """Retrieve edge data from OpenStreetMap.
 
     Only `LineString` will be kept.
@@ -399,7 +508,7 @@ def retrieve_edges(
     if len(data) > 0:
         edges = geopd.GeoDataFrame(pd.concat(data), geometry="geometry")
     else:
-        return geopd.GeoDataFrame([], geometry=[])
+        return Edges(geopd.GeoDataFrame([], geometry=[]))
     edges.geometry = edges.geometry.line_merge()
     # Keep only `LineString` objects
     edges = (
@@ -411,13 +520,283 @@ def retrieve_edges(
     # Remove duplicates
     edges = edges[~edges.index.duplicated(keep="first")]
     edges["name"] = range(len(edges))
-    log.info(f"Collected {len(edges)} edges.")
-    edges = edges.dropna(how="all", axis=1)
+    # edges = edges.dropna(how="all", axis=1)
 
-    return geopd.GeoDataFrame(edges, geometry="geometry", crs=PRJ_DEG)
+    # drop eventual duplicated edges.
+    edges.geometry = edges.normalize()
+    edges = edges.drop_duplicates("geometry")
+    edges = edges.reset_index()
+    log.info(f"Collected {len(edges)} edges.")
+    return Edges(geopd.GeoDataFrame(edges, geometry="geometry", crs=PRJ_DEG))
 
 
 # More utilities
+
+
+@dataclass
+class Base:
+    data: geopd.GeoDataFrame
+
+    def __post_init__(self):
+        pass
+
+    def to_meters(self) -> Self:
+        self.data = self.data.to_crs(PRJ_MET)
+        return self
+
+    def to_degree(self, inline: bool = False) -> Self:
+        self.data = self.data.to_crs(PRJ_DEG)
+        return self
+
+    def append(self, other: Self) -> Self:
+        assert self.crs == other.crs
+        self.data = geopd.GeoDataFrame(
+            pd.concat([self.data, other.data]), geometry="geometry", crs=self.crs
+        )
+        return self
+
+    def drop_duplicates(self) -> Self:
+        # drop eventual duplicated items.
+        self.data.geometry = self.data.normalize()
+        self.data = self.data.drop_duplicates("geometry")
+        return self
+
+    @property
+    def crs(self):
+        return self.data.crs
+
+    @property
+    def index(self) -> pd.Index:
+        return self.data.index
+
+    def __len__(self):
+        return len(self.data)
+
+
+class Nodes(Base):
+    def __post_init__(self):
+        # Utilities and cache
+        self._sindex_updated_ = False
+        self._sindex_ = None
+
+    def strtree(self) -> shapely.STRtree:
+        """The `STRtree` of nodes."""
+        if not self._sindex_updated_ or self._sindex_ is None:
+            self._sindex_ = shapely.STRtree(self.data.geometry)
+        return self._sindex_
+
+    def aggregate(self, distance: float = 0.0) -> Self:
+        self.data = cluster_points(
+            self.data.reset_index(),
+            distance=distance,
+            aggfunc={"id": list} | {c: mode for c in set(self.data.columns) - {"geometry"}},
+        )
+        self.data.index = [id[0] for id in self.data["id"]]
+        return self
+
+
+class Edges(Base):
+    def __post_init__(self) -> None:
+        # Utilities and cache
+        self._sindex_updated_ = {"e": False, "s": False, "t": False}
+        self._sindex_ = {}
+
+    def node(self, id):
+        return self.data[(self.data["source"] == id) | (self.data["target"] == id)]
+
+    def remove_self_loops(self) -> Self:
+        self.data = self.data[self.data["source"] != self.data["target"]]
+        return self
+
+    @property
+    def source(self):
+        return self.data["source"]
+
+    @property
+    def target(self):
+        return self.data["target"]
+
+    def add_nodes(
+        self, nodes: Nodes, max_distance: float = 0.0, max_distance_bounds: float = 0.0
+    ) -> None:
+        """Add nodes as source and targets and eventually split edges accordingly."""
+
+        rename = {}
+        for id, node in nodes.data.geometry.items():
+            # check if close to boundary
+            i_source = self.strtree("s").query(
+                node, predicate="dwithin", distance=max_distance_bounds
+            )
+            i_target = self.strtree("t").query(
+                node, predicate="dwithin", distance=max_distance_bounds
+            )
+            for ied in i_source:
+                rename[self.data.iloc[ied]["source"]] = id
+            for ied in i_target:
+                rename[self.data.iloc[ied]["target"]] = id
+
+            # Closest node to source
+            i_edges = self.strtree("e").query_nearest(
+                node, max_distance=max_distance, all_matches=True
+            )
+            # Cycle over all closest edges
+            for ied in i_edges:
+                old_edge = self.data.iloc[ied]
+
+                # split in the closest point
+                node_pos = old_edge.geometry.project(node)
+                if node_pos <= 1e-8:
+                    rename[self.data.iloc[ied]["source"]] = id
+                elif node_pos >= old_edge.geometry.length - 1e-8:
+                    rename[self.data.iloc[ied]["target"]] = id
+                else:
+                    new_edge1 = old_edge.to_dict()
+                    new_edge2 = old_edge.to_dict()
+                    new_edge1["geometry"] = ops.substring(old_edge.geometry, 0, node_pos)
+                    new_edge1["target"] = id
+                    new_edge2["geometry"] = ops.substring(
+                        old_edge.geometry, node_pos, old_edge.geometry.length
+                    )
+                    new_edge2["source"] = id
+
+                    self.data = geopd.GeoDataFrame(
+                        pd.concat(
+                            [self.data.drop(index=[ied]), pd.DataFrame([new_edge1, new_edge2])],
+                            ignore_index=True,
+                        )
+                    ).set_crs(self.data.crs, allow_override=True, inplace=True)
+                    self._sindex_updated_["e"] = False
+                    self._sindex_updated_["s"] = False
+                    self._sindex_updated_["t"] = False
+
+        self.data["source"] = self.data["source"].replace(rename)
+        self.data["target"] = self.data["target"].replace(rename)
+
+        self.drop_duplicates()
+
+    def strtree(self, kind: Literal["e", "s", "t"] = "e") -> shapely.STRtree:
+        """The `STRtree` of edges.
+
+        e -> edges (whole lines)
+        s -> source nodes
+        t -> target nodes
+        """
+        if not self._sindex_updated_[kind]:
+            if kind == "e":
+                self._sindex_[kind] = shapely.STRtree(self.data.geometry)
+            elif kind == "s":
+                self._sindex_[kind] = shapely.STRtree([p.geoms[0] for p in self.data.boundary])
+            elif kind == "t":
+                self._sindex_[kind] = shapely.STRtree([p.geoms[1] for p in self.data.boundary])
+            self._sindex_updated_[kind] = True
+        return self._sindex_[kind]
+
+    def split_edges_when_touching(self) -> Edges:
+        """Joins edges at their intersection.
+
+        If the extreme of an edge touches the another edge, the latter is splitted in that point
+
+        Parameters
+        ----------
+        edges: geopd.GeoDataFrame :
+
+
+        Returns
+        -------
+
+        """
+        log.info("Splitting edges to connect when touching.")
+
+        # Check if two edges touch each other and eventually split them at the intersection
+        new_edges = {}
+        for edge_id1, edge1 in self.data.geometry.items():
+            # find touching edges.
+            touches_s = set(self.strtree("s").query(edge1, predicate="intersects"))
+            touches_s -= set(self.strtree("s").query(edge1.boundary, predicate="intersects"))
+            touches_t = set(self.strtree("t").query(edge1, predicate="intersects"))
+            touches_t -= set(self.strtree("t").query(edge1.boundary, predicate="intersects"))
+            touches = touches_s | touches_t
+
+            if len(touches) > 0:
+                ll = shapely.MultiLineString(self.data.iloc[list(touches)]["geometry"].tolist())
+                try:
+                    new_edges[self.data.index[edge_id1]] = shapely.MultiLineString(
+                        ops.split(edge1, ll)
+                    )
+                except ValueError:
+                    # sometime they are overlapping
+                    pass
+                # no need to recompute strtree!
+
+        new_edges = pd.Series(new_edges)
+        self.data.loc[new_edges.index, "geometry"] = new_edges
+        self.data.geometry = self.data.geometry.replace(new_edges)
+
+        self.data = self.data.explode("geometry", ignore_index=True)
+
+        self.drop_duplicates()
+
+    def nodes_from_boundaries(
+        self, prefix: str, source_col: str | None = None, target_col: str | None = None
+    ) -> Nodes:
+        """Extract nodes at the boundaries of each edge.
+
+        Aggregate overlapping nodes.
+        """
+        edgeBoundary_nodes = self.data.boundary
+        edgeBoundary_nodes = geopd.GeoDataFrame(
+            pd.DataFrame(
+                {
+                    "source": [f"s{i}" for i in range(len(edgeBoundary_nodes))],
+                    "target": [f"t{i}" for i in range(len(edgeBoundary_nodes))],
+                    "geometry": edgeBoundary_nodes,
+                }
+            ),
+            geometry="geometry",
+            crs=self.crs,
+        )
+
+        exploded = edgeBoundary_nodes.explode()
+        exploded["id"] = (
+            exploded["source"].iloc[0::2].tolist() + exploded["target"].iloc[1::2].tolist()
+        )
+        exploded["id"] = [
+            e[label] for _, e in edgeBoundary_nodes.iterrows() for label in ["source", "target"]
+        ]
+
+        # find clusters within very short distance
+        clustered = cluster_points(
+            geopd.GeoDataFrame(exploded[["geometry", "id"]]),
+            distance=1e-5,
+            aggfunc={"id": [list, "first"]},
+        )
+        clustered = clustered.rename(columns={("id", "list"): "idlist", ("id", "first"): "id"})
+        cluster_map = {
+            node: prefix + str(ic)
+            for ic, cluster in enumerate(clustered["idlist"])
+            for node in cluster
+        }
+
+        edgeBoundary_nodes["source"] = edgeBoundary_nodes["source"].map(cluster_map)
+        edgeBoundary_nodes["target"] = edgeBoundary_nodes["target"].map(cluster_map)
+
+        clustered["id"] = clustered["id"].map(cluster_map)
+
+        if source_col is not None:
+            self.data[source_col] = edgeBoundary_nodes["source"]
+        if target_col is not None:
+            self.data[target_col] = edgeBoundary_nodes["target"]
+
+        return Nodes(clustered.drop(columns="idlist").set_index("id", drop=True))
+
+    def drop_duplicates_edges(self) -> Self:
+        # remove multiple paths between the same nodes (usually parallel paths.)
+        self.data["__idx__"] = pd.Index(
+            [frozenset([e["source"], e["target"]]) for _, e in self.data.iterrows()]
+        )
+        self.data = self.data.drop_duplicates("__idx__").drop(columns=["__idx__"])
+
+        return self
 
 
 @dataclass
@@ -461,31 +840,11 @@ class Graph:
         if len(self.edges) == 0:
             self.nodes = geopd.GeoDataFrame({"id": [], "geometry": []}, crs=self.edges.crs)
             return self
-        node_map: dict[geometry.base.BaseGeometry, str] = {}
-        source_target: list[dict[str, int | Hashable]] = []
-        for id, line in self.edges.geometry.items():
-            # Nodes geometry
-            try:
-                s, t = line.boundary.geoms
-            except ValueError:
-                raise
-            # Source node id
-            s_id = node_map.setdefault(s, node_prefix + str(len(node_map)))
-            # Target node id
-            t_id = node_map.setdefault(t, node_prefix + str(len(node_map)))
-            source_target.append({source_col: s_id, target_col: t_id, "index": id})
 
-        self.nodes = geopd.GeoDataFrame(
-            [{"id": v, "geometry": k} for k, v in node_map.items()],
-            geometry="geometry",
-            crs=self.edges.crs,
-        ).set_index("id", drop=True)
+        self.nodes, source_target = nodes_from_edges(self.edges, prefix=node_prefix)
+        self.edges["source"] = source_target["source"]
+        self.edges["target"] = source_target["target"]
 
-        self.edges = geopd.GeoDataFrame(
-            pd.concat(
-                [self.edges, pd.DataFrame(source_target).set_index("index", drop=True)], axis=1
-            )
-        )
         return self
 
     def index(self) -> pd.Index:
@@ -542,10 +901,10 @@ class Graph:
     def merge_edges(self, other: Graph) -> Graph:
         """Merge the edges of two `Graph` and adapt nodes accordingly.
 
-        1. find edges in self that covers edges in other
-        2. find edges in other that covers edges is self
-        3. remove them (identical edges should be taken only once)
-        4. rename the nodes.
+        1. Find edges in self that covers edges in other
+        2. Find edges in other that covers edges is self
+        3. Remove them (identical edges should be taken only once)
+        4. Rename the nodes.
         """
         all_nodes = pd.concat([self.nodes, other.nodes])
         all_edges = pd.concat([self.edges, other.edges], ignore_index=True)
@@ -762,6 +1121,83 @@ def _clean_voltage(voltage: pd.Series) -> pd.Series:
     return voltage.apply(_convert)
 
 
+def graph_from_shortest_path(
+    edges: Edges, nodes: Nodes, tokeep: str = "__keep__", grouping_distance: float = 0.0
+) -> tuple[geopd.GeoDataFrame, geopd.GeoDataFrame]:
+    """From nodes build the network following shortest paths if they do not overlap."""
+    points = nodes.data[nodes.data[tokeep]]
+    pedges = edges.data
+    pedges["weight"] = pedges.length
+
+    graph = nx.from_pandas_edgelist(pedges[["source", "target", "weight"]], edge_attr=True)
+    # Aggregate if possible
+    if grouping_distance > 0.0:
+        points = cluster_points(
+            points.reset_index(),
+            distance=grouping_distance,
+            aggfunc={"id": list} | {c: mode for c in set(points.columns) - {"geometry"}},
+        )
+        for _, point in points.iterrows():
+            graph.add_edges_from(nx.complete_graph(point["id"]).edges(), weight=1e-10)
+        points.index = pd.Index([min(i) for _, i in points["id"].items()])
+    else:
+        points["id"] = [[idx] for idx in points.index]
+
+    # Use `frozenset` to check for undirected edges.
+    pedges.index = pd.Index(
+        [frozenset([e["source"], e["target"]]) for _, e in edges.data.iterrows()]
+    )
+    ids = []
+    for p1, p2 in combinations(points.index, 2):
+        d = []
+        for pp1, pp2 in product(points.loc[p1, "id"], points.loc[p2, "id"]):
+            try:
+                d.append(nx.shortest_path(graph, pp1, pp2, "weight"))
+            except nxexc.NetworkXNoPath:
+                pass
+
+        if len(d) == 0:
+            continue
+
+        shortest_path = min(d, key=lambda x: nx.path_weight(graph, x, "weight"))
+
+        nodes_along_path = nodes.data.loc[shortest_path[1:-1], "geometry"].union_all()
+        nodes_exept_boundary = points.geometry.drop([p1, p2]).union_all()
+
+        # check if this path pass through other points.
+        if len(points.index.intersection(shortest_path[1:-1])) == 0:
+            if nodes_along_path.distance(nodes_exept_boundary) < 800:
+                continue
+            ids += [
+                {
+                    "edge": frozenset([e1, e2]),
+                    "__id__": len(ids),
+                    "source": shortest_path[0],
+                    "target": shortest_path[-1],
+                }
+                for e1, e2 in zip(shortest_path[:-1], shortest_path[1:])
+            ]
+
+    new_edges = pd.DataFrame(ids)
+    new_edges = geopd.GeoDataFrame(
+        pd.concat(
+            [
+                new_edges,
+                pedges.drop(columns=["source", "target"]).loc[new_edges["edge"]].reset_index(),
+            ],
+            axis=1,
+        ),
+        crs=edges.crs,
+    )
+
+    merged = new_edges.dissolve("__id__")
+    merged.geometry = merged.geometry.line_merge()
+    merged["type"] = merged.geometry.geom_type
+    merged.to_file("/tmp/merged.geojson")
+
+    return merged, points
+
+
 def project_edges_to_nodes(
     edges: geopd.GeoDataFrame, nodes: geopd.GeoDataFrame, max_distance: float
 ) -> geopd.GeoDataFrame:
@@ -790,7 +1226,10 @@ def project_edges_to_nodes(
 
 
 def split_lines_at_points(
-    nodes: geopd.GeoDataFrame, edges: geopd.GeoDataFrame, max_distance: float = 0.0
+    nodes: geopd.GeoDataFrame,
+    edges: geopd.GeoDataFrame,
+    max_distance: float = 0.0,
+    max_distance_bounds: float = 0.0,
 ) -> geopd.GeoDataFrame:
     """Split lines which fall close to the given nodes.
 
@@ -815,28 +1254,40 @@ def split_lines_at_points(
         The edges connected to the points within `distance`
 
     """
-    if "name" not in nodes.columns:
-        nodes["name"] = range(len(nodes))
-    if "name" not in edges.columns:
-        edges["name"] = range(len(edges))
     mnodes = nodes.copy().to_crs(PRJ_MET)
-    medges = edges.copy().to_crs(PRJ_MET)
+    medges = Edges(edges).to_meters()
 
-    # Use `sindex` for quickness
-    edges_sindex = shapely.STRtree(medges.geometry)
+    medges.add_nodes(mnodes, max_distance=max_distance, max_distance_bounds=max_distance_bounds)
+    return medges.to_degree().data
+
     Cache = namedtuple(
         "Cache", field_names=["toremove", "newedges", "usednodes"], defaults=[[], [], []]
     )
 
     cache = Cache()
+    to_repeat = False
+
     for id, mnode in mnodes.geometry.items():
+        # check if close to boundary
+        if max_distance_bounds > 0.0:
+            i_source = source_sindex.query(mnode, predicate="within", distance=10)
+            i_target = target_sindex.query(mnode, predicate="within", distance=10)
+
+            for ied in i_source:
+                if ied in cache.toremove:
+                    to_repeat = True
+                else:
+                    medges.loc[medges.index[ied], "source"] = id
+            for ied in i_target:
+                if ied in cache.toremove:
+                    to_repeat = True
+                else:
+                    medges.loc[medges.index[ied], "target"] = id
+
         # closest node to source
-        i_edges = edges_sindex.query_nearest(mnode, max_distance=max_distance, all_matches=False)
+        i_edges = edges_sindex.query_nearest(mnode, max_distance=max_distance, all_matches=True)
 
-        if len(i_edges) > 0:
-            # if there is some edges within distance, it should be just one.
-            ied = i_edges[0]
-
+        for ied in i_edges:
             # if this edge has already be used,
             # skip it. We will check it next iteration
             if ied in cache.toremove:
@@ -848,27 +1299,25 @@ def split_lines_at_points(
 
             # split in the closest point
             node_pos = old_edge.geometry.project(mnode)
-            if node_pos <= 0:
-                cache.toremove.append(ied)
-                new_edge1["source"] = id
-                cache.newedges.append(new_edge1)
-                cache.usednodes.append(id)
-            elif node_pos >= old_edge.geometry.length:
-                cache.toremove.append(ied)
+
+            if ied in cache.toremove:
+                to_repeat = True
+                continue
+            if node_pos <= 1e-5:
+                medges.loc[medges.index[ied], "source"] = id
+            elif node_pos >= old_edge.geometry.length - 1e-5:
+                medges.loc[medges.index[ied], "target"] = id
+            else:
+                new_edge1["geometry"] = ops.substring(old_edge.geometry, 0, node_pos)
                 new_edge1["target"] = id
-                cache.newedges.append(new_edge1)
+                new_edge2["geometry"] = ops.substring(
+                    old_edge.geometry, node_pos, old_edge.geometry.length
+                )
+                new_edge2["source"] = id
+
+                cache.toremove.append(ied)
+                cache.newedges.extend([new_edge1, new_edge2])
                 cache.usednodes.append(id)
-
-            new_edge1["geometry"] = ops.substring(old_edge.geometry, 0, node_pos)
-            new_edge1["target"] = id
-            new_edge2["geometry"] = ops.substring(
-                old_edge.geometry, node_pos, old_edge.geometry.length
-            )
-            new_edge2["source"] = id
-
-            cache.toremove.append(ied)
-            cache.newedges.extend([new_edge1, new_edge2])
-            cache.usednodes.append(id)
 
     # Substitute with the updated geometries
 
@@ -877,7 +1326,7 @@ def split_lines_at_points(
             [medges.drop(index=cache.toremove), pd.DataFrame(cache.newedges)], ignore_index=True
         )
     ).set_crs(PRJ_MET, allow_override=True)
-    if len(cache.toremove) > 0:
+    if to_repeat > 0:
         _edges = split_lines_at_points(
             nodes=nodes.drop(index=cache.usednodes), edges=_edges, max_distance=max_distance
         )
@@ -1025,7 +1474,7 @@ def add_fuzzy_nodes(
 
 
 def cluster_points(
-    points: geopd.GeoDataFrame, distance: float = 100, column: str = "__node_clusters__"
+    points: geopd.GeoDataFrame, distance: float = 100, column: str = "__node_clusters__", **kwargs
 ) -> geopd.GeoDataFrame:
     """Cluster nodes that are within `distance` (meters). Based on the `DBSCAN`.
 
@@ -1035,11 +1484,56 @@ def cluster_points(
     labels = cluster.DBSCAN(eps=distance, min_samples=2).fit_predict(
         [[p.x, p.y] for p in data_in_meters]
     )
-    solitons = labels == 1
+    solitons = labels == -1
     maxlabels = labels.max()
     labels[solitons] = np.arange(sum(solitons)) + (maxlabels + 1)
     points[column] = labels
-    return points.dissolve(by=column, aggfunc="first").reset_index(drop=True)
+    return points.dissolve(by=column, **kwargs).reset_index(drop=True)
+
+
+def nodes_from_edges(
+    edges: geopd.GeoDataFrame, prefix: str
+) -> tuple[geopd.GeoDataFrame, pd.DataFrame]:
+    """Extract nodes at the boundaries of each edge.
+
+    Aggregate overlapping nodes.
+    """
+    edgeBoundary_nodes = edges.boundary
+    edgeBoundary_nodes = geopd.GeoDataFrame(
+        pd.DataFrame(
+            {
+                "source": [f"s{i}" for i in range(len(edgeBoundary_nodes))],
+                "target": [f"t{i}" for i in range(len(edgeBoundary_nodes))],
+                "geometry": edgeBoundary_nodes,
+            }
+        ),
+        geometry="geometry",
+        crs=edges.crs,
+    )
+    exploded = edgeBoundary_nodes.explode()
+    exploded["id"] = exploded["source"].iloc[0::2].tolist() + exploded["target"].iloc[1::2].tolist()
+    exploded["id"] = [
+        e[label] for _, e in edgeBoundary_nodes.iterrows() for label in ["source", "target"]
+    ]
+
+    # find clusters within very short distance
+    clustered = cluster_points(
+        geopd.GeoDataFrame(exploded[["geometry", "id"]]),
+        distance=1e-5,
+        aggfunc={"id": [list, "first"]},
+    )
+    clustered = clustered.rename(columns={("id", "list"): "idlist", ("id", "first"): "id"})
+    cluster_map = {
+        node: prefix + str(ic) for ic, cluster in enumerate(clustered["idlist"]) for node in cluster
+    }
+
+    edgeBoundary_nodes["source"] = edgeBoundary_nodes["source"].map(cluster_map)
+    edgeBoundary_nodes["target"] = edgeBoundary_nodes["target"].map(cluster_map)
+    clustered["id"] = clustered["id"].map(cluster_map)
+
+    return clustered.drop(columns="idlist").set_index("id", drop=True), edgeBoundary_nodes[
+        ["source", "target"]
+    ]
 
 
 def _join_line_point_buffered(
@@ -1087,7 +1581,7 @@ def _join_line_point_buffered(
     return _line
 
 
-def split_edges_when_touching(edges: geopd.GeoDataFrame) -> geopd.GeoDataFrame:
+def split_edges_when_touching(edges: Edges) -> Edges:
     """Joins edges at their intersection.
 
     If the extreme of an edge touches the another edge, the latter is splitted in that point
@@ -1269,6 +1763,29 @@ def buffer(data: geopd.GeoDataFrame, buf_size: float = 2.0) -> geopd.GeoDataFram
     # cache it
     buffer.to_file(cache)
     return buffer
+
+
+def merge(paths: str[Path]) -> Graph | None:
+    """Merge two or more graphs from a list of paths."""
+    # Load the countries
+
+    graph: Graph | None = None
+
+    for pl_path in paths:
+        log.info(pl_path)
+
+        pl = Graph.read(pl_path)
+
+        if len(pl) == 0:
+            continue
+
+        if graph is None:
+            graph = Graph(edges=pl.edges.copy(), region=pl.region)
+            graph.nodes = pl.nodes.copy()
+        else:
+            graph = graph.merge_edges(pl)
+
+    return graph
 
 
 check_cache_size()
