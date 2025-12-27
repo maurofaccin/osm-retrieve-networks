@@ -12,7 +12,7 @@ osm.logconfig.setup_logging("INFO")
 
 
 def retrieve() -> None:
-    countries = osm.load_regions(test=True)
+    countries = osm.load_regions(test=True).sort_values("code")
     print(countries)
     _retrieve(countries)
 
@@ -28,7 +28,8 @@ def _retrieve(data: pd.DataFrame) -> None:
             continue
         else:
             pl = osm.osm_railways(region["geometry"], node_prefix=str(region["code"]) + "_")
-            pl.write(pl_path)
+            if len(pl) > 0:
+                pl.write(pl_path)
 
 
 def merge() -> None:
@@ -107,8 +108,19 @@ def fix_edges(graph: osm.Graph, path: Path) -> osm.Graph:
     return graph
 
 
+def blend():
+    g1 = osm.Graph.read(
+        "~/curro/working_data/osm_retrieve_networks/graphs_railways_EU/graph_PD_railways.gpkg"
+    )
+    g2 = osm.Graph.read(
+        "~/curro/working_data/osm_retrieve_networks/graphs_railways_EU/graph_RO_railways.gpkg"
+    )
+    g1.blend(g2)
+
+
 if __name__ == "__main__":
     retrieve()
+    # blend()
     # retrieve_countries()
     # merge()
     # test_merge()
