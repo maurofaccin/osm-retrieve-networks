@@ -26,6 +26,7 @@ import pyproj
 import shapely
 import tqdm
 from matplotlib import axes
+from matplotlib.pylab import subplot
 from networkx import exception as nxexc
 from scipy import sparse
 from shapely import geometry, ops, plotting
@@ -91,7 +92,6 @@ def osm_railways(
         ],
     )
 
-    # edges = edges.simplify(only_smooth=True)
     if len(edges) > 0:
         edges = edges.split_edges_when_touching()
 
@@ -125,18 +125,19 @@ def osm_railways(
             region=geopd.GeoDataFrame([{"region": 0}], geometry=[enclosing_polygon], crs=PRJ_DEG),
         )
 
-    # get nodes from edges and assigne source and target columns accordingly
-    edgeBoundary_nodes = edges.nodes_from_boundaries(
-        prefix="__tmp_node_", source_col="source", target_col="target"
-    )
+    # get nodes from edges and assign source and target columns accordingly
+    edgeBoundary_nodes = edges.nodes_from_boundaries(prefix="__tmp_node_")
     edgeBoundary_nodes.data["__keep__"] = False
     edgeBoundary_nodes.data.loc[
         ~edgeBoundary_nodes.data.geometry.intersects(enclosing_polygon), "__keep__"
     ] = True
+    edges = edges.drop_duplicated_edges()
 
     edges = edges.to_meters()
     nodes = nodes.to_meters()
+    # TODO: group stops and stations in metastations!!!!
     edges = edges.add_nodes(nodes, max_distance=300, max_distance_bounds=10)
+    edges = edges.drop_duplicated_edges()
 
     # Join temp and real nodes.
     log.info("Add stations to nodes")
@@ -146,7 +147,13 @@ def osm_railways(
 
     # Clean form self loops.
     edges = edges.cleanup()
-    edges, nodes = graph_from_shortest_path(edges, nodes, grouping_distance=500)
+    edges, nodes = graph_from_shortest_path(edges, nodes, avoid_distance=500)
+    edges.data.to_file("test_PD_edges.geojson")
+    nodes.data.to_file("test_PD_nodes.geojson")
+    print(edges.data)
+    print(nodes.data)
+    print("Ciao")
+    exit()
 
     region = geopd.GeoDataFrame([{"region": 0}], geometry=[enclosing_polygon], crs=PRJ_DEG)
     if len(edges) == 0 or len(nodes) == 0:
@@ -408,7 +415,6 @@ def retrieve_edges(
         edges = Edges(geopd.GeoDataFrame(pd.concat(data), geometry="geometry", crs=PRJ_DEG))
     else:
         return Edges(geopd.GeoDataFrame([], geometry=[]))
-    edges.data.to_file("~/curro/working_data/osm_retrieve_networks/graphs_railways_EU/xxx.geojson")
     edges = edges.cleanup()
     edges.data["name"] = range(len(edges))
     log.info(f"Collected {len(edges)} edges.")
@@ -528,66 +534,23 @@ class Nodes(Base):
         return self_sorted >= other_sorted
 
 
-@dataclass
-class Edge:
-    source: Hashable
-    target: Hashable
-
-    def __post_init__(self):
-        self.source, self.target = sorted([self.source, self.target])
-
-    def astuple(self):
-        return self.source, self.target
-
-    def __hash__(self):
-        return hash(self.astuple())
-
-    def __eq__(self, other) -> bool:
-        if not isinstance(other, Edge):
-            return False
-        return self.astuple() == other.astuple()
-
-    def __lt__(self, other) -> bool:
-        if not isinstance(other, Edge):
-            return NotImplemented
-        return self.astuple() < other.astuple()
-
-    def __le__(self, other) -> bool:
-        if not isinstance(other, Edge):
-            return NotImplemented
-        return self.astuple() <= other.astuple()
-
-    def __gt__(self, other) -> bool:
-        if not isinstance(other, Edge):
-            return NotImplemented
-        return self.astuple() > other.astuple()
-
-    def __ge__(self, other) -> bool:
-        if not isinstance(other, Edge):
-            return NotImplemented
-        return self.astuple() >= other.astuple()
-
-    def __str__(self) -> str:
-        return f"{self.source} -- {self.target}"
-
-
 class Edges(Base):
+    """Edge data.
+
+    Warning: the columns `source`, `target` and `weight` will be overwritten.
+    """
+
     def __post_init__(self) -> None:
         # Utilities and cache
         self._sindex_updated_ = {"e": False, "s": False, "t": False}
         self._sindex_ = {}
-        self.update_index()
-
-    def update_index(self) -> None:
-        if "target" in self.data.columns and "target" in self.data.columns:
-            self.data.index = [Edge(e["source"], e["target"]) for _, e in self.data.iterrows()]
 
     def node(self, id):
         """Return edges incident in given node."""
-        return self.data[(self.data["source"] == id) | (self.data["target"] == id)]
+        return self.data[(self.source == id) | (self.target == id)]
 
     def remove_self_loops(self) -> Self:
-        self.data = self.data[self.data["source"] != self.data["target"]]
+        self.data = self.data[self.source != self.target]
         return self
 
     @property
@@ -642,19 +605,15 @@ class Edges(Base):
         splitters["edgeid"] = actions["edgeid"]
         # change to edges
         splitters = splitters.reset_index().dissolve("edgeid", aggfunc={"nodeid": list})
-        print(splitters)
-        exit()
 
         self.data = self.data.loc[self.index.drop_duplicates().tolist()]
+
         new_edges = Edges(
             geopd.GeoDataFrame(
                 pd.concat(
                     [
                         split_edge_at_points(
-                            self.data.iloc[self.data.index.get_loc(edgeid)],
-                            splitter,
-                            self.crs,
-                            point_names="nodeid",
+                            self.data.loc[edgeid], splitter, self.crs, point_names="nodeid"
                         )
                         for edgeid, splitter in splitters.iterrows()
                     ]
@@ -663,7 +622,6 @@ class Edges(Base):
             )
         )
         new_edges = new_edges.append(self.drop(index=splitters.index))
-        new_edges.update_index()
         return new_edges
 
     def strtree(self, kind: Literal["e", "s", "t"] = "e") -> shapely.STRtree:
@@ -702,15 +660,12 @@ class Edges(Base):
 
         self.data.geometry = list(new_edges)
         self.data = self.data.explode("geometry", ignore_index=True)
-        self.update_index()
 
         self.cleanup()
         self._sindex_updated_ = {"e": False, "s": False, "t": False}
         return self
 
-    def nodes_from_boundaries(
-        self, prefix: str, source_col: str | None = None, target_col: str | None = None
-    ) -> Nodes:
+    def nodes_from_boundaries(self, prefix: str) -> Nodes:
         """Extract nodes at the boundaries of each edge.
 
         Aggregate overlapping nodes.
@@ -733,7 +688,7 @@ class Edges(Base):
         exploded["id"] = [f"{prefix}_{i}" for i in range(len(exploded))]
         log.info(f"Got {len(exploded)} additional nodes")
 
-        log.info("Remove duplicates. (Keep the first name)")
+        log.info("Remove overlapping nodes. (Keep the first name)")
         rename = exploded.set_index("geometry", drop=True)["id"].to_dict()
         edgeBoundary_nodes["source"] = [
             rename.get(edge.geometry.geoms[0], edge["source"])
@@ -745,81 +700,15 @@ class Edges(Base):
         ]
         log.info(f"Still {len(exploded)} nodes")
 
-        if source_col is not None:
-            self.data[source_col] = edgeBoundary_nodes["source"]
-        if target_col is not None:
-            self.data[target_col] = edgeBoundary_nodes["target"]
-        self.update_index()
+        self.data["source"] = edgeBoundary_nodes["source"]
+        self.data["target"] = edgeBoundary_nodes["target"]
 
         return Nodes(exploded.drop(columns=["source", "target"]).set_index("id", drop=True))
 
-    def drop_duplicates_edges(self) -> Self:
+    def drop_duplicated_edges(self) -> Edges:
         # remove multiple paths between the same nodes (usually parallel paths.)
-        self.update_index()
-        self.data = self.data[self.data.index.drop_duplicates()]
-        return self
-
-    def simplify(self, only_smooth: bool = False) -> Edges:
-        """Join Lines that are touching."""
-        log.info("Simplify edges")
-        sources = []
-        targets = []
-
-        # create a network of touching edges.
-        for idx1, edge1 in tqdm.tqdm(self.data.geometry.items(), total=len(self)):
-            id1 = self.data.index.get_loc(idx1)
-
-            touches = self.strtree("e").query(edge1, predicate="touches")
-            # Intersection contains self
-            intersect = self.strtree("e").query(edge1, predicate="intersects")
-
-            if len(touches) == 0 or len(touches) > 2:
-                # no more than 2 neighbors
-                continue
-
-            if len(touches) != len(intersect) - 1:
-                # the only intersections should be touches
-                continue
-
-            if len(touches) == 2:
-                # one neighbor per side (I need exactly two neighbors)
-                ps = shapely.union_all(
-                    [
-                        edge1.boundary.intersection(self.data.geometry.iloc[i].boundary)
-                        for i in touches
-                    ]
-                )
-                if isinstance(ps, shapely.Point):
-                    # I expect a MultiPoint with two Points
-                    continue
-
-            for id2 in touches:
-                edge2 = self.data.geometry.iloc[id2]
-                if (edge1.boundary.intersection(edge2.boundary)).is_empty:
-                    continue
-
-                if only_smooth and not check_smooth(edge1, edge2):
-                    continue
-
-                sources.append(id1)
-                targets.append(id2)
-
-        csg = sparse.coo_matrix(
-            (np.ones_like(sources), (sources, targets)), shape=(len(self.data), len(self.data))
-        )
-        _, self.data["__groups__"] = sparse.csgraph.connected_components(csg)
-        new_edges = self.data.dissolve(by="__groups__", aggfunc=mode)
-
-        new_edges = Edges(new_edges)
-        # give up on unfixable lines
-        new_edges = new_edges.cleanup()
-
-        if (new_edges.data.geometry.geom_type == "LineString").all():
-            return new_edges
-        else:
-            log.warning("Some non LineString in the merger")
-
-        return self
+        dup_indx = pd.Index([frozenset([e.source, e.target]) for _, e in self.data.iterrows()])
+        return Edges(self.data.loc[~dup_indx.duplicated()])
 
     def cleanup(self) -> Edges:
         # remove MultiLineString if possible
@@ -832,7 +721,6 @@ class Edges(Base):
         self.data = self.data.loc[[len(p.geoms) == 2 for p in self.data.boundary]]
 
         self.drop_duplicates()
-        self.update_index()
         return self
 
 
@@ -1261,8 +1149,6 @@ def graph_from_shortest_path(
     edges: Edges,
     nodes: Nodes,
     tokeep: str = "__keep__",
-    columns: list[str] = ["source", "target"],
-    weight: str = "weight",
     avoid_distance: float = 0.0,
     force_smooth: bool = False,
 ) -> tuple[Edges, Nodes]:
@@ -1276,26 +1162,24 @@ def graph_from_shortest_path(
         nodes
     tokeep: str
         column name that contains a boolean variable identifying the nodes that should be kept.
-    columns: list[str]
-        the columns including `source`, `target`
     avoid_distance: float
         path approaching other nodes to keep are discarded if they fall within this distance
     force_smooth: bool
         discard non-smooth paths
     """
     points = nodes.data[nodes.data[tokeep]]
-    edges.data[weight] = edges.data.length
+    edges.data["weight"] = edges.data.length
 
-    graph = nx.from_pandas_edgelist(edges.data[columns + [weight]], edge_attr=True)
+    graph = nx.from_pandas_edgelist(edges.data[["source", "target", "weight"]], edge_attr=True)
     gcc = nx.number_connected_components(graph)
     if gcc > 1:
         log.warning(f"Number of components: {gcc}")
     # Use `frozenset` to check for undirected edges.
-    edges.data.index = pd.Index(
-        [Edge(e[columns[0]], e[columns[1]]) for _, e in edges.data.iterrows()]
-    )
-    print(edges.index.has_duplicates)
-    exit()
+    iloc = {
+        (e[side[0]], e[side[1]]): ie
+        for ie, (k, e) in enumerate(edges.data.iterrows())
+        for side in [("source", "target"), ("target", "source")]
+    }
     ids = []
 
     for ipair, pair in enumerate(
@@ -1314,13 +1198,10 @@ def graph_from_shortest_path(
         if path is None:
             continue
 
-        print(pair, path)
-        subedges = edges.data.loc[[Edge(e1, e2) for e1, e2 in zip(path, path[1:])]]
-        print(subedges.line_merge())
-        print(shapely.line_merge(subedges.geometry.tolist()))
-        exit()
+        # subedges = edges.data.iloc[[iloc[(e1, e2)] for e1, e2 in zip(path, path[1:], strict=False)]]
+        # print(ops.linemerge(subedges.geometry.tolist()))
         ids += [
-            {"edge": Edge(e1, e2), "__id__": ipair, "source": path[0], "target": path[-1]}
+            {"edge": iloc[(e1, e2)], "__id__": ipair, "source": path[0], "target": path[-1]}
             for e1, e2 in zip(path, path[1:], strict=False)
         ]
 
@@ -1329,7 +1210,7 @@ def graph_from_shortest_path(
         pd.concat(
             [
                 new_edges,
-                pedges.drop(columns=["source", "target"]).loc[new_edges["edge"]].reset_index(),
+                edges.data.drop(columns=["source", "target"]).iloc[new_edges["edge"]].reset_index(),
             ],
             axis=1,
         ),
@@ -2102,7 +1983,7 @@ def __add_node_to_edges__(
     if len(edges_ids) > 0:
         result["edgeid"] = edges.data.index[edges_ids]
         result["type"] = "source"
-        result["rename"] = edges.data.iloc[edges_ids[0]]["source"]
+        result["rename"] = edges.data.iloc[edges_ids[0]].source
 
         return result
 
@@ -2113,7 +1994,7 @@ def __add_node_to_edges__(
     if len(edges_ids) > 0:
         result["edgeid"] = edges.data.index[edges_ids]
         result["type"] = "target"
-        result["rename"] = edges.data.iloc[edges_ids[0]]["target"]
+        result["rename"] = edges.data.iloc[edges_ids[0]].target
 
         return result
 
@@ -2184,17 +2065,12 @@ def __add_nodes__(
             for p in lnode.geometry
         ]
     )
-    print(ops.split(edge["geometry"], points))
-    exit()
     edge["geometry"] = shapely.MultiLineString(ops.split(edge["geometry"], points))
 
     # collect node's name to save in source and target
     ids = [edge["source"]] + lnode[nodeid_col].tolist() + [edge["target"]]
-    print(ids)
     splitted_edges = geopd.GeoDataFrame(pd.DataFrame(edge).T, crs=nodes.crs)
-    print(splitted_edges)
     splitted_edges = splitted_edges.explode(column="geometry")
-    print(splitted_edges)
     splitted_edges["source"] = ids[:-1]
     splitted_edges["target"] = ids[1:]
 
@@ -2274,8 +2150,6 @@ def split_edge_at_points(
         extremes = [0.0, line.project(splitter, normalized=True), 1.0]
     elif isinstance(splitter, shapely.MultiPoint):
         extremes = [0.0] + [line.project(s, normalized=True) for s in splitter.geoms] + [1.0]
-
-    print(edge)
 
     extremes = pd.DataFrame(
         {"loc": extremes, "path": [edge.source] + points[point_names] + [edge.target]}
