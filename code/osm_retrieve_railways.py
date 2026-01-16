@@ -12,7 +12,7 @@ osm.logconfig.setup_logging("INFO")
 
 
 def retrieve() -> None:
-    countries = osm.load_regions(test=True).sort_values("code")
+    countries = osm.load_regions(test=False).sort_values("code")
     print(countries)
     _retrieve(countries)
 
@@ -27,7 +27,14 @@ def _retrieve(data: pd.DataFrame) -> None:
         if pl_path.is_file() and False:
             continue
         else:
-            pl = osm.osm_railways(region["geometry"], node_prefix=str(region["code"]) + "_")
+            pl = osm.osm_railways(
+                region["geometry"],
+                osm_dump_file=(
+                    "~/curro/working_data/geodata/osm_dump/EU_railways_nodes.gpkg",
+                    "~/curro/working_data/geodata/osm_dump/EU_railways_edges.gpkg",
+                ),
+                node_prefix=str(region["code"]) + "_",
+            )
             if len(pl) > 0:
                 pl.write(pl_path)
 
