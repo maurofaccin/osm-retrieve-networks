@@ -126,6 +126,7 @@ def osm_railways(
             "wheelchair",
             "uic_ref",
         ],
+        node_prefix=node_prefix,
     )
     nodes.data["__keep__"] = True
 
@@ -154,7 +155,8 @@ def osm_railways(
 
     # Add a clique between nodes/stops in the same station
     new_edges = new_cliques(nodes, aggregated)
-    graph.edges = graph.edges.append(new_edges).drop_duplicated_edges()
+    if len(new_edges) > 0:
+        graph.edges = graph.edges.append(new_edges).drop_duplicated_edges()
 
     graph = graph_from_shortest_path(
         graph,
@@ -596,6 +598,7 @@ class Edges(Base):
             ),
             list(nodes.data.iterrows()),
             chunksize=10,
+            desc="Adding nodes",
         )
 
         # Collect all actions to be performed `split`, `source` and `target`.
@@ -678,7 +681,10 @@ class Edges(Base):
         new_data = self.data
 
         new_edges = process_map(
-            partial(__split_edge__, self), new_data.geometry.tolist(), chunksize=10
+            partial(__split_edge__, self),
+            new_data.geometry.tolist(),
+            chunksize=10,
+            desc="Split nodes",
         )
 
         new_data.geometry = list(new_edges)
@@ -831,6 +837,7 @@ class Graph:
                 ),
                 list(nodes.data.iterrows()),
                 chunksize=10,
+                desc="Add nodes (find edges)",
             )
         )
         if "edgeid" not in edges.columns:
@@ -848,9 +855,7 @@ class Graph:
 
         # Rename nodes (on the boundaries)
         rename = {
-            action["rename"]: nid
-            for nid, action in actions.iterrows()
-            if action["rename"] is not None
+            action["rename"]: nid for nid, action in actions.iterrows() if action["type"] != "split"
         }
         new_edges["source"] = new_edges["source"].replace(rename)
         new_edges["target"] = new_edges["target"].replace(rename)
@@ -875,20 +880,26 @@ class Graph:
                 splitters[bound], "geometry"
             ].values  # add column ignoring index
 
-        new_edges = Edges(
-            gpd.GeoDataFrame(
-                pd.concat(
-                    [
-                        split_edge_at_points(
-                            new_edges.loc[edgeid], splitter, self.edges.crs, point_names="nodeid"
-                        )
-                        for edgeid, splitter in splitters.iterrows()
-                    ]
-                ),
-                crs=self.edges.crs,
+        if len(splitters) > 0:
+            new_edges = Edges(
+                gpd.GeoDataFrame(
+                    pd.concat(
+                        [
+                            split_edge_at_points(
+                                new_edges.loc[edgeid],
+                                splitter,
+                                self.edges.crs,
+                                point_names="nodeid",
+                            )
+                            for edgeid, splitter in splitters.iterrows()
+                        ]
+                    ),
+                    crs=self.edges.crs,
+                )
             )
-        )
-        new_edges = new_edges.append(self.edges.drop(index=splitters.index))
+            new_edges = new_edges.append(self.edges.drop(index=splitters.index))
+        else:
+            new_edges = self.edges
 
         # Only nodes involved in links
         new_nodes_idx = list(set(new_edges.data.source) | set(new_edges.data.target))
@@ -1193,11 +1204,11 @@ class Graph:
 
     @classmethod
     def read(cls, path: Path) -> Graph:
-        edges = gpd.read_file(path, layer="edges")
-        nodes = gpd.read_file(path, layer="nodes")  # .set_index("id", drop=True)
-        region = gpd.read_file(path, layer="region")
+        edges = gpd.read_file(path, layer="edges").set_crs(PRJ_DEG, allow_override=True)
+        nodes = gpd.read_file(path, layer="nodes").set_crs(PRJ_DEG, allow_override=True)
+        region = gpd.read_file(path, layer="region").set_crs(PRJ_DEG, allow_override=True)
 
-        g = Graph(edges=Edges(edges), region=region)
+        g = Graph(edges=Edges(edges), region=region, nodes=Nodes(nodes))
         g.nodes.append(Nodes(nodes))
 
         return g
@@ -1209,7 +1220,7 @@ class Graph:
         self.edges.data.drop(columns=["index"], errors="ignore").to_file(
             path, driver="GPKG", layer="edges"
         )
-        self.nodes.data.to_file(path, driver="GPKG", layer="nodes")
+        self.nodes.data.to_file(path, driver="GPKG", layer="nodes", index=False)
         self.region.to_file(path, driver="GPKG", layer="region")
 
     def graph_ig(self):
@@ -1227,15 +1238,32 @@ class Graph:
 
         if subset is None:
             subset = self.nodes.index
+
+        components = [set(cc) for cc in graph_ig.connected_components(mode="strong")]
+
         assert len(set(subset) - set(nodes)) == 0, f"Not included {set(subset) - set(nodes)}"
 
-        for node in tqdm.tqdm(subset, desc="SPs"):
-            for path in graph_ig.get_shortest_paths(
-                node, [x for x in subset if x > node], weights="weight", mode="all"
-            ):
-                if len(path) == 0:
-                    continue
-                yield nodes[path]
+        i = 0
+        for component in tqdm.tqdm(components, desc="Short paths"):
+            indx = subset.intersection(nodes[list(component)])
+            i += 1
+            if len(indx) < 2:
+                continue
+            for node in tqdm.tqdm(indx, desc=f"Component {i}"):
+                for path in graph_ig.get_shortest_paths(
+                    node, [x for x in indx if x > node], weights="weight", mode="all"
+                ):
+                    if len(path) == 0 or path is None:
+                        continue
+                    yield nodes[path]
+
+        # for node in tqdm.tqdm(subset, desc="SPs"):
+        #     for path in graph_ig.get_shortest_paths(
+        #         node, [x for x in subset if x > node], weights="weight", mode="all"
+        #     ):
+        #         if len(path) == 0 or path is None:
+        #             continue
+        #         yield nodes[path]
 
     def clean_disconnected_nodes(self) -> Graph:
         n = self.nodes.data
@@ -1315,7 +1343,6 @@ def graph_from_shortest_path(
         for side in [("source", "target"), ("target", "source")]
     }
 
-    # compute all paths
     paths = (
         __shortest_path__(
             graph,
@@ -2278,12 +2305,11 @@ def split_edge_at_points(
 
 
 def new_cliques(nodes: Nodes, clusters: pd.Series) -> Edges:
-    new_edges = []
-    for cluster in clusters:
-        if len(cluster) > 1:
-            new_edges.append(clique(nodes.data.loc[cluster]))
+    new_edges = [clique(nodes.data.loc[cluster]) for cluster in clusters if len(cluster) > 1]
 
-    return Edges(gpd.GeoDataFrame(pd.concat(new_edges), geometry="geometry", crs=nodes.crs))
+    if len(new_edges) > 0:
+        return Edges(gpd.GeoDataFrame(pd.concat(new_edges), geometry="geometry", crs=nodes.crs))
+    return Edges()
 
 
 check_cache_size()
