@@ -1,17 +1,19 @@
-"""Load the regions of interest and fi too large split them in smaller pieces."""
+"""Load the regions of interest, find countries too large, and split them in smaller pieces."""
 
 from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
 
-datapath = Path("../data/")
+datapath = Path("~/curro/working_data/geodata/").expanduser()
 
 
 def main() -> None:
     """Do the main."""
 
-    adms = gpd.read_file(datapath / "gadm_410.gpkg").set_index("UID", drop=True)
+    adms = gpd.read_file(datapath / "gadm_410.gpkg").set_index("UID", drop=True).to_crs(3857)
+    print(adms)
+    exit()
     adms["UID"] = adms.index
     adms = adms[adms["CONTINENT"] == "Europe"]
     adms = adms[
@@ -40,11 +42,11 @@ def main() -> None:
             col = f"GID_{level - 1}"
             break
         adm = adms.dissolve(by=col)
-        adm = adm[adm.area <= 15.0]
+        adm = adm[adm.area <= 50e9]  # 50,000 km^2
         adm[col] = adm.index
         print(set(adm["GID_0"].to_list()))
         adms = adms[~(adms[col].isin(adm.index))]
-        right_adms.append(adm)
+        right_adms.append(adm.to_crs(4326))
 
     # the remaining
     print(adms)
@@ -57,7 +59,8 @@ def main() -> None:
 
     right = gpd.GeoDataFrame(right.sort_index(), crs=4326)
     right.geometry = right.simplify_coverage(tolerance=0.01)
-    right.to_file("../data/regions_europe.geojson")
+    # right.to_file("../data/regions_europe.geojson")
+    right.to_file("/tmp/regions_europe.geojson")
 
 
 if __name__ == "__main__":
