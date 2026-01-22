@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import osm
-import pandas as pd
+import osm_utils
 
 datapath = osm.DATA / Path("graphs_railways_EU")
 datapath.mkdir(parents=True, exist_ok=True)
@@ -10,19 +10,16 @@ osm.logconfig.setup_logging("INFO")
 
 
 def retrieve() -> None:
-    countries = osm.load_regions(test=False).sort_values("code")
+    countries = osm_utils.load_regions(grow_regions=0.1, test=False).sort_values(by="code")
     print(countries)
-    _retrieve(countries)
 
-
-def _retrieve(data: pd.DataFrame) -> None:
-    for id, region in data.iterrows():
-        osm.log.info(f"{id}/{len(data)}, {region['code']}")
+    for id, region in countries.iterrows():
+        osm.log.info(f"{id}/{len(countries)}, {region['code']}")
         if isinstance(region["geometry"], str):
             osm.logging.info(region["geometry"])
         pl_path = datapath / f"graph_{region['code']}_railways.gpkg"
 
-        if pl_path.is_file() and True:
+        if pl_path.is_file() and False:
             osm.log.warning(f"File {pl_path.name} already present.")
             continue
         else:
@@ -75,5 +72,5 @@ def blend():
 
 
 if __name__ == "__main__":
-    # retrieve()
-    merge()
+    retrieve()
+    # merge()
