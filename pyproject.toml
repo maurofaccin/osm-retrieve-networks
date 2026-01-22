@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.10.6",
     "mpld3>=0.5.11",
     "osmnx>=2.0.6",
+    "pygeoops>=0.6.0",
     "pyrosm>=0.6.2",
     "scikit-learn>=1.7.2",
     "tqdm>=4.67.1",

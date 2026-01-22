@@ -644,6 +644,7 @@ dependencies = [
     { name = "matplotlib" },
     { name = "mpld3" },
     { name = "osmnx" },
+    { name = "pygeoops" },
     { name = "pyrosm" },
     { name = "scikit-learn" },
     { name = "tqdm" },
@@ -665,6 +666,7 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.6" },
     { name = "mpld3", specifier = ">=0.5.11" },
     { name = "osmnx", specifier = ">=2.0.6" },
+    { name = "pygeoops", specifier = ">=0.6.0" },
     { name = "pyrosm", specifier = ">=0.6.2" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
     { name = "tqdm", specifier = ">=4.67.1" },
@@ -823,6 +825,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/23/e8/21db9c9987b0e728855bd57bff6984f67952bea55d6f75e055c46b5383e8/platformdirs-4.4.0.tar.gz", hash = "sha256:ca753cf4d81dc309bc67b0ea38fd15dc97bc30ce419a7f58d13eb3bf14c4febf", size = 21634, upload-time = "2025-08-26T14:32:04.268Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/40/4b/2028861e724d3bd36227adfa20d3fd24c3fc6d52032f4a93c133be5d17ce/platformdirs-4.4.0-py3-none-any.whl", hash = "sha256:abd01743f24e5287cd7a5db3752faf1a2d65353f38ec26d98e25a6db65958c85", size = 18654, upload-time = "2025-08-26T14:32:02.735Z" },
+]
+
+[[package]]
+name = "pygeoops"
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "geopandas" },
+    { name = "numpy" },
+    { name = "pyproj" },
+    { name = "shapely" },
+    { name = "topojson" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c8/a9/eb105f6a5a5863c70a1d32e88e4e7b4e53403b8810e13a545064d0be0fb7/pygeoops-0.6.0.tar.gz", hash = "sha256:062282752fd6c6f1255fb6b31c702379b1466bdb0fd2579b08d21496df35ac82", size = 55504, upload-time = "2025-11-02T17:35:55.138Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/16/bb033060a00fe6c2a68c6f0c8c757c55cea4b4854b19dc5128c33e9f1266/pygeoops-0.6.0-py3-none-any.whl", hash = "sha256:570d6a1e2252801d3b8fba40f6b63326ea24f130e71ae37138940a35c02675d8", size = 36860, upload-time = "2025-11-02T17:35:54.044Z" },
 ]
 
 [[package]]
@@ -1222,6 +1240,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b7/4d/08c89e34946fce2aec4fbb45c9016efd5f4d7f24af8e5d93296e935631d8/threadpoolctl-3.6.0.tar.gz", hash = "sha256:8ab8b4aa3491d812b623328249fab5302a68d2d71745c8a4c719a2fcaba9f44e", size = 21274, upload-time = "2025-03-13T13:49:23.031Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl", hash = "sha256:43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb", size = 18638, upload-time = "2025-03-13T13:49:21.846Z" },
+]
+
+[[package]]
+name = "topojson"
+version = "1.10"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "shapely" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/79/f3/74330050d8f7e05e140e6043302f71524e159f9a83bbee9681c86282f8fd/topojson-1.10.tar.gz", hash = "sha256:a7f53406324061a0310bec46740a6609147c24daeb354596c68345b9527b38c1", size = 25444042, upload-time = "2025-07-22T20:27:31.638Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6f/7a/2a8ea3b2b6e50cbec74c53082b69617d71f31e1247e35e65bf9a6edc44cf/topojson-1.10-py3-none-any.whl", hash = "sha256:0879d727c7798939e3268e8969fa87c2cd23274189fe3d8038a0fb11ff263925", size = 83318, upload-time = "2025-07-22T20:27:28.374Z" },
 ]
 
 [[package]]
