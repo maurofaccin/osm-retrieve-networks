@@ -1190,12 +1190,6 @@ class Graph:
         mgraph.nodes.index.name = "id"
         return mgraph
 
-    def largest_component(self):
-        g = nx.from_pandas_edgelist(self.edges, source="source", target="target")
-        largest_component = list(max(nx.connected_components(g), key=len))
-
-        return self.filter_nodes(largest_component)
-
     def __str__(self) -> str:
         return "\n".join(map(str, [self.edges, self.nodes]))
 
@@ -1220,7 +1214,7 @@ class Graph:
         self.edges.data.drop(columns=["index"], errors="ignore").to_file(
             path, driver="GPKG", layer="edges"
         )
-        self.nodes.data.to_file(path, driver="GPKG", layer="nodes", index=False)
+        self.nodes.data.to_file(path, driver="GPKG", layer="nodes", index=True)
         self.region.to_file(path, driver="GPKG", layer="region")
 
     def graph_ig(self):
@@ -1231,6 +1225,21 @@ class Graph:
             directed=False,
         )
 
+    @property
+    def connected_components(self) -> list[set]:
+        try:
+            return self.cc
+        except AttributeError:
+            pass
+        graph_ig = self.graph_ig()
+        nodes = np.array(graph_ig.vs["name"])
+        self.cc = [set(nodes[cc]) for cc in graph_ig.connected_components(mode="strong")]
+        return self.cc
+
+    def largest_component(self) -> Graph:
+        largest_component = list(max(self.connected_components, key=len))
+        return self.filter_nodes(largest_component)
+
     def shortest_paths(self, subset: pd.Index | None = None):
         """Yields the shortest paths between any two nodes."""
         graph_ig = self.graph_ig()
@@ -1239,13 +1248,11 @@ class Graph:
         if subset is None:
             subset = self.nodes.index
 
-        components = [set(cc) for cc in graph_ig.connected_components(mode="strong")]
-
         assert len(set(subset) - set(nodes)) == 0, f"Not included {set(subset) - set(nodes)}"
 
         i = 0
-        for component in tqdm.tqdm(components, desc="Short paths"):
-            indx = subset.intersection(nodes[list(component)])
+        for component in tqdm.tqdm(self.connected_components, desc="Short paths"):
+            indx = subset.intersection(component)
             i += 1
             if len(indx) < 2:
                 continue
@@ -1256,14 +1263,6 @@ class Graph:
                     if len(path) == 0 or path is None:
                         continue
                     yield nodes[path]
-
-        # for node in tqdm.tqdm(subset, desc="SPs"):
-        #     for path in graph_ig.get_shortest_paths(
-        #         node, [x for x in subset if x > node], weights="weight", mode="all"
-        #     ):
-        #         if len(path) == 0 or path is None:
-        #             continue
-        #         yield nodes[path]
 
     def clean_disconnected_nodes(self) -> Graph:
         n = self.nodes.data
@@ -1333,6 +1332,9 @@ def graph_from_shortest_path(
     elif isinstance(metanodes, pd.Series):
         points = graph.nodes.data.loc[metanodes.index]
         avoid = graph.nodes.data.loc[metanodes.explode()]
+    # do not avoid nodes outside the region of interest
+    # This is because those nodes have not been aggregated and can fall close to the station.
+    avoid = avoid[avoid.geometry.within(graph.region.iloc[0].geometry)]
 
     edges = graph.edges
     edges.data["weight"] = edges.data.length
@@ -1877,79 +1879,6 @@ def align_line_points(line: geometry.LineString, points: gpd.GeoDataFrame) -> gp
     return lines
 
 
-def load_regions(buffer_size: float | None = None, test: bool | None = None) -> gpd.GeoDataFrame:
-    """Load the countries (and regions) with an optional buffer.
-
-    For now Europe.
-    """
-    fn = "../data/prov_test.geojson" if test else "../data/regions_europe.geojson"
-    regions = gpd.read_file(fn).rename(columns={"index": "code"})[["code", "geometry"]]
-
-    if buffer_size is None or buffer_size <= 0.0:
-        return regions
-
-    reg_buffer = buffer(regions, buf_size=buffer_size)
-    reg_buffer = split_cells(reg_buffer, cell_size=buffer_size)
-    regions = gpd.GeoDataFrame(pd.concat([regions, reg_buffer]))
-
-    return regions
-
-
-def split_cells(areas: gpd.GeoDataFrame, cell_size: float = 2.0) -> gpd.GeoDataFrame:
-    """Split large polygons in smaller cells."""
-
-    bounds = areas.geometry.total_bounds
-    nx = int((bounds[2] - bounds[0]) / cell_size) + 1
-    ny = int((bounds[3] - bounds[1]) / cell_size) + 1
-
-    xes = np.linspace(bounds[0], bounds[2], nx)
-    yes = np.linspace(bounds[1], bounds[3], ny)
-
-    tiles = gpd.GeoDataFrame(
-        [
-            {"geometry": shapely.box(x1, y1, x2, y2)}
-            for x1, x2 in zip(xes, xes[1:])
-            for y1, y2 in zip(yes, yes[1:])
-        ]
-    )
-
-    tiles["code"] = [f"BUFFER_{i:04d}" for i in tiles.index]
-    tiles.geometry = tiles.intersection(areas.union_all(grid_size=0.01))
-    # keep only the overlapping areas
-    tiles = tiles[tiles.area > 0]
-
-    return tiles
-
-
-def buffer(data: gpd.GeoDataFrame, buf_size: float = 2.0) -> gpd.GeoDataFrame:
-    """Create a buffer around a `GeoDataFrame`."""
-    cache = Path("../data/regions_europe_buffer.geojson")
-
-    if cache.is_file():
-        return gpd.read_file(cache)
-
-    buf = None
-    for country in tqdm.tqdm(data.geometry):
-        if buf is None:
-            buf = country.buffer(buf_size)
-        else:
-            buf = buf.union(country.buffer(buf_size), grid_size=0.01)
-
-    if buf is not None:
-        buffer = gpd.GeoDataFrame(
-            [{"region": "EU"}],
-            geometry=[shapely.difference(buf, data.union_all(), grid_size=0.01)],
-            crs=4326,
-        )
-
-    else:
-        buffer = gpd.GeoDataFrame([], geometry=[])
-
-    # cache it
-    buffer.to_file(cache)
-    return buffer
-
-
 def merge(paths: list[Path]) -> Graph | None:
     """Merge two or more graphs from a list of paths."""
     # Load the countries
@@ -2158,53 +2087,6 @@ def __add_nodes__(
     return splitted_edges, rename
 
 
-def __shortest_path_old__(
-    graph: nx.Graph,
-    nodes: Nodes,
-    edges: Edges,
-    pair: tuple,
-    nodes_to_avoid: pd.Index | None = None,
-    avoid_within: float = 0.0,
-    force_smooth: bool = False,
-) -> list | None:
-    """Find the shortest path between `pair = (p1, p2)`."""
-    p1, p2 = pair
-    try:
-        path = nx.shortest_path(graph, p1, p2, "weight")
-    except nxexc.NetworkXNoPath:
-        # There is no shortest path between `p1` and `p2`
-        return
-
-    # avoid all nodes except its own boundaries.
-    if nodes_to_avoid is not None:
-        metanode1 = nodes.data.loc[p1, "__metanode__"]
-        metanode2 = nodes.data.loc[p2, "__metanode__"]
-        _nodes_to_avoid = set(nodes_to_avoid.drop(metanode1 + metanode2))
-        if len(_nodes_to_avoid.intersection(path)) > 0:
-            return
-
-        if avoid_within > 0.0:
-            min_distance = shapely.distance(
-                nodes.data.loc[path[1:-1]].geometry.union_all(),
-                nodes.data.loc[list(_nodes_to_avoid)].geometry.union_all(),
-            )
-            if min_distance < avoid_within:
-                return
-
-    # if `force_smooth` remove non smooth paths
-    if force_smooth and len(path) > 2:
-        for p1, p2, p3 in zip(path, path[1:], path[2:], strict=False):
-            e1 = edges.get_link(p1, p2)
-            e2 = edges.get_link(p2, p3)
-            if e1 is None or e2 is None:
-                msg = f"No such edge. (e1: {p1}-{p1}, e2: {p2}-{p3})"
-                raise ValueError(msg)
-            if not check_smooth(e1.geometry, e2.geometry):
-                return
-
-    return path
-
-
 def __shortest_path__(
     graph: Graph,
     path: list,
@@ -2220,14 +2102,19 @@ def __shortest_path__(
     if nodes_to_avoid is not None:
         metanode1 = metanodes[p1]
         metanode2 = metanodes[p2]
-        _nodes_to_avoid = set(nodes_to_avoid.drop(metanode1 + metanode2))
+        _nodes_to_avoid = set(nodes_to_avoid.drop(metanode1 + metanode2, errors="ignore"))
 
         if avoid_within > 0.0:
+            # remove this path if any of the nodes to avoid fall within distance from the path
             min_distance = shapely.distance(
                 graph.nodes.data.loc[path[1:-1]].geometry.union_all(),
                 graph.nodes.data.loc[list(_nodes_to_avoid)].geometry.union_all(),
             )
             if min_distance < avoid_within:
+                return
+        else:
+            # remove only if the nodes to avoid are in the path
+            if len(_nodes_to_avoid & set(path)) > 0:
                 return
 
     # if `force_smooth` remove non smooth paths
