@@ -10,7 +10,7 @@ osm.logconfig.setup_logging("INFO")
 
 
 def retrieve() -> None:
-    countries = osm_utils.load_regions(grow_regions=0.1, test=False).sort_values(by="code")
+    countries = osm_utils.load_regions(grow_regions=0.1, test=True).sort_values(by="code")
     print(countries)
 
     for id, region in countries.iterrows():
@@ -35,42 +35,25 @@ def retrieve() -> None:
                 pl.write(pl_path)
 
 
-def merge() -> None:
-    """Do the main."""
-    # Load the countries
-
-    graph: osm.Graph | None = None
-
-    for pl_path in sorted(datapath.glob("graph_[A-Z]*_railways.gpkg")):
-        osm.log.info(pl_path.name)
-
-        pl = osm.Graph.read(pl_path)
-        # pl = fix_edges(pl, pl_path)
-
-        if len(pl) == 0:
-            continue
-
+def merge():
+    graph = None
+    graphs = sorted(datapath.glob("graph_[A-Z]*_railways.gpkg"))
+    for pl_path in graphs:
+        print(pl_path)
         if graph is None:
-            graph = pl
+            graph = osm.Graph.read(pl_path, node_index="NODE_ID").to_meters()
         else:
-            # graph = graph.merge_edges(pl)
-            graph.nodes = graph.nodes.append(pl.nodes)
-            graph.edges = graph.edges.append(pl.edges)
+            graph = graph.merge(osm.Graph.read(pl_path, node_index="NODE_ID").to_meters(), tol=50)
 
-    if graph is not None:
-        graph.write(datapath / "graph_all_graph.gpkg")
-
-
-def blend():
-    g1 = osm.Graph.read(
-        "~/curro/working_data/osm_retrieve_networks/graphs_railways_EU/graph_PD_railways.gpkg"
-    )
-    g2 = osm.Graph.read(
-        "~/curro/working_data/osm_retrieve_networks/graphs_railways_EU/graph_RO_railways.gpkg"
-    )
-    g1.blend(g2)
+    if graph is None:
+        return
+    graph = graph.to_degree()
+    graph.write(datapath / "merged_full.gpkg")
+    graph = graph.largest_component()
+    graph.write(datapath / "merged_GCC.gpkg")
 
 
 if __name__ == "__main__":
-    retrieve()
+    # retrieve()
     # merge()
+    merge()
