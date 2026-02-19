@@ -14,7 +14,9 @@ import pandas as pd
 
 
 def build_query(
-    pbf_file: Path, kind: Literal["railway"] = "railway", geom: Literal["points", "lines"] = "lines"
+    pbf_file: Path,
+    kind: Literal["railway", "power_distribution"] = "railway",
+    geom: Literal["points", "lines"] = "lines",
 ) -> str:
     """Build the query to perform on the database."""
     print(pbf_file)
@@ -30,6 +32,12 @@ def build_query(
             }
         else:
             tags = {"railway": ["station", "halt", "stop"]}
+    elif kind == "power_distribution":
+        tags = {
+            "transformer": ["distribution"],
+            "substation": ["minor_distribution"],
+            "power": ["substation"],
+        }
     else:
         raise NotImplementedError()
 
@@ -178,6 +186,17 @@ def togdf(query: str, explode: int = 50):
 pbf_file = Path("~/curro/working_data/osm_sources/europe-latest.osm.pbf").expanduser()
 # pbf_file = Path("~/Downloads/albania-260210.osm.pbf").expanduser()
 
+
+gdf = pd.concat(
+    [
+        togdf(build_query(pbf_file, kind="power_distribution", geom="points")),
+        togdf(build_query(pbf_file, kind="power_distribution", geom="lines")),
+    ],
+    axis=0,
+)
+gdf.geometry = gdf.geometry.representative_point()
+gdf.to_file("power_distribution.gpkg")
+exit()
 
 gdf = togdf(build_query(pbf_file, kind="railway", geom="points"))
 gdf.to_file(Path("EU_railways.gpkg"), driver="GPKG", layer="points", mode="w")
