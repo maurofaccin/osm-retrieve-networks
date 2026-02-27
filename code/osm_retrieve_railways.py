@@ -10,7 +10,7 @@ osm.logconfig.setup_logging("INFO")
 
 
 def retrieve() -> None:
-    countries = osm_utils.load_regions(grow_regions=0.1, test=True).sort_values(by="code")
+    countries = osm_utils.load_regions(grow_regions=0.1, test=False).sort_values(by="code")
     print(countries)
 
     for id, region in countries.iterrows():
@@ -19,15 +19,17 @@ def retrieve() -> None:
             osm.logging.info(region["geometry"])
         pl_path = datapath / f"graph_{region['code']}_railways.gpkg"
 
-        if pl_path.is_file() and False:
+        if pl_path.is_file() and True:
             osm.log.warning(f"File {pl_path.name} already present.")
             continue
         else:
             pl = osm.osm_railways(
                 region["geometry"],
                 osm_dump_file=(
-                    "~/curro/working_data/geodata/osm_dump/EU_railways_nodes.gpkg",
-                    "~/curro/working_data/geodata/osm_dump/EU_railways_edges.gpkg",
+                    "./EU_railways.gpkg",
+                    "./EU_railways.gpkg",
+                    # "~/curro/working_data/geodata/osm_dump/EU_railways_nodes.gpkg",
+                    # "~/curro/working_data/geodata/osm_dump/EU_railways_edges.gpkg",
                 ),
                 node_prefix=str(region["code"]) + "_",
             )
@@ -44,7 +46,6 @@ def merge():
             graph = osm.Graph.read(pl_path, node_index="NODE_ID").to_meters()
         else:
             graph = graph.merge(osm.Graph.read(pl_path, node_index="NODE_ID").to_meters(), tol=50)
-
     if graph is None:
         return
     graph = graph.to_degree()
@@ -53,7 +54,28 @@ def merge():
     graph.write(datapath / "merged_GCC.gpkg")
 
 
+def merge_test():
+    graph = None
+    graphs = sorted(datapath.glob("graph_ITA.*_railways.gpkg")) + [
+        datapath / "graph_CHE_railways.gpkg",
+        datapath / "graph_FRA.7_1_railways.gpkg",
+        datapath / "graph_GBR.1.44_1_railways.gpkg",
+    ]
+    for pl_path in graphs:
+        print(pl_path)
+        if graph is None:
+            graph = osm.Graph.read(pl_path, node_index="NODE_ID").to_meters()
+        else:
+            graph = graph.merge(osm.Graph.read(pl_path, node_index="NODE_ID").to_meters(), tol=50)
+    if graph is None:
+        return
+    graph = graph.to_degree()
+    graph.write(Path("merged_full.gpkg"))
+    graph = graph.largest_component()
+    graph.write(Path("merged_GCC.gpkg"))
+
+
 if __name__ == "__main__":
-    # retrieve()
-    # merge()
+    retrieve()
+    # merge_test()
     merge()

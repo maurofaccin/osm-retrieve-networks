@@ -12,7 +12,7 @@ from functools import partial
 from itertools import combinations
 from numbers import Number
 from pathlib import Path
-from typing import Hashable, Iterable, Literal, Self
+from typing import Generator, Hashable, Iterable, Literal, Self
 
 import geopandas as gpd
 import igraph as ig
@@ -20,6 +20,7 @@ import logconfig
 import numpy as np
 import osmnx as ox
 import pandas as pd
+import pygeoops
 import pyproj
 import shapely
 import tqdm
@@ -67,7 +68,11 @@ def osm_railways(
         the powerplants
     """
     # Retrieving the enclosing polygon.
-    enclosing_polygon = get_geolocation(place=place) if isinstance(place, str) else place
+    enclosing_polygon = place
+    if enclosing_polygon.area > 10:
+        log.warning(f"Area of size {enclosing_polygon.area}")
+    else:
+        log.info(f"Area of size {enclosing_polygon.area}")
 
     # get file location
     if isinstance(osm_dump_file, (str, Path)):
@@ -155,27 +160,29 @@ def osm_railways(
     if len(new_edges) > 0:
         graph.edges = graph.edges.append(new_edges).drop_duplicated_edges()
 
+    graph.edges.data = graph.edges.data.reset_index(drop=True)
     graph = graph_from_shortest_path(
         graph,
         metanodes=aggregated,
         avoid_distance=300,  # do not increase too much
-        force_smooth=False,
+        force_smooth=True,
     )
     return graph.to_degree()
 
 
 def osm_powerlines(
-    place: str | geometry.Polygon | geometry.MultiPolygon,
+    place: geometry.Polygon | geometry.MultiPolygon,
+    osm_dump_file: str | Path | tuple[str | Path, str | Path],
+    node_prefix: str = "",
     substation_distance: float = 500,
     voltage_fillvalue: float | None = None,
     voltage_threshold: float = 1000,
-    node_prefix: str = "",
-) -> tuple[Graph, gpd.GeoDataFrame]:
+) -> tuple[Graph, Nodes]:
     """Retrieve the power-line network.
 
     Parameters
     ----------
-    place: str | geometry.Polygon | geometry.MultiPolygon
+    place: geometry.Polygon | geometry.MultiPolygon
         Retrieve data from this place: e.g. `Padova`, `London`, `France`… or a `[Multi]Polygon`.
     voltage_fillvalue : float | None :
          (Default value = None)
@@ -192,111 +199,125 @@ def osm_powerlines(
         the powerplants
     """
     # Retrieving the enclosing poligon.
-    enclosing_polygon = get_geolocation(place=place) if isinstance(place, str) else place
+    enclosing_polygon = place
     if enclosing_polygon.area > 10:
         log.warning(f"Area of size {enclosing_polygon.area}")
     else:
         log.info(f"Area of size {enclosing_polygon.area}")
+
+    # get file location
+    if isinstance(osm_dump_file, (str, Path)):
+        osm_dump_file_nodes = osm_dump_file
+        osm_dump_file_edges = osm_dump_file
+    else:
+        osm_dump_file_nodes, osm_dump_file_edges = osm_dump_file
+
     # Retrieve lines from OpenStreetMap.
-    log.info("Retrieving edges from OpenStreetMap.")
-    edges = retrieve_edges(keys={"power": ["cable", "line"]}, polygon=enclosing_polygon).rename(
-        columns={"source": "power_source"}
+    graph = retrieve_edges(
+        osm_dump_file=osm_dump_file_edges,
+        keys={"power": ["cable", "line"]},
+        polygon=enclosing_polygon,
+        columns=[
+            "id",
+            "index",
+            "cables",
+            "capacity",
+            "frequency",
+            "line",
+            "geometry",
+            "maxcurrent",
+            "name",
+            "operator",
+            "power",
+            "power:maximum",
+            "power:used",
+            "power_source",
+            "source",
+            "source:power",
+            "submarine",
+            "target",
+            "type",
+            "voltage",
+        ],
+        node_prefix=f"{node_prefix}_",
+        split_when_touching=True,
     )
-    edges = edges[
-        edges.columns.intersection(
-            [
-                "id",
-                "index",
-                "cables",
-                "capacity",
-                "frequency",
-                "line",
-                "geometry",
-                "maxcurrent",
-                "name",
-                "operator",
-                "power",
-                "power:maximum",
-                "power:used",
-                "power_source",
-                "source",
-                "source:power",
-                "submarine",
-                "target",
-                "type",
-                "voltage",
-            ]
+    graph.edges = graph.edges.rename(columns={"source": "power_source"})
+
+    if len(graph.edges) == 0:
+        return graph, gpd.GeoDataFrame([], crs=PRJ_DEG)
+
+    if "voltage" in graph.edges.columns:
+        graph.edges.data["voltage"] = _clean_voltage(graph.edges.data["voltage"])
+    else:
+        graph.edges.data["voltage"] = pd.NA
+
+    if voltage_fillvalue is None:
+        graph.edges = graph.edges.dropna(subset="voltage")
+        graph.edges.data = graph.edges.data[graph.edges.data["voltage"] >= voltage_threshold]
+    else:
+        # Retains the lower voltage (1k-69k Volts) power-lines.
+        # Assumes non reported voltage is lower than 69kV.
+        # This is risky as the network is not that accurately reported.
+        graph.edges.data["voltage"] = graph.edges.data["voltage"].fillna(voltage_fillvalue)
+        log.warning("You assume that edges with no voltage are below 69k.")
+
+    log.info("Retrieving substations from OpenStreetMap.")
+    # Retrieve substations (additional nodes).
+    # These substations are used to *merge* lines that do not touch.
+    # Look for substations within the following polygon
+    substation_polygon = ops.transform(
+        MET2DEG,
+        graph.edges.to_meters().data.buffer(2 * substation_distance, resolution=2).union_all(),
+    )
+    log.info("get nodes")
+    substations = retrieve_nodes(
+        osm_dump_file=osm_dump_file_nodes,
+        node_prefix="substation_{node_prefix}_",
+        polygon=substation_polygon,
+        keys={"power": ["substation"]},
+    )
+
+    log.info("add substations fuzzily")
+    if len(substations) > 0:
+        substations = cluster_points(substations.data, distance=substation_distance)
+        graph = graph.add_nodes(
+            Nodes(substations),
+            max_distance=substation_distance,
+            max_distance_bounds=substation_distance,
         )
-    ]
-    if len(edges) > 0:
-        if "voltage" in edges.columns:
-            edges.voltage = _clean_voltage(edges.voltage)
-        else:
-            edges["voltage"] = pd.NA
-
-        if voltage_fillvalue is None:
-            edges = edges.dropna(subset="voltage")
-            edges = edges[edges.voltage >= voltage_threshold]
-        else:
-            # Retains the lower voltage (1k-69k Volts) power-lines.
-            # Assumes non reported voltage is lower than 69kV.
-            # This is risky as the network is not that accurately reported.
-            edges.voltage = edges.voltage.fillna(voltage_fillvalue)
-            log.warning("You assume that edges with no voltage are below 69k.")
-        edges = split_edges_when_touching(edges.reset_index(drop=False))
-
-        log.info("Retrieving substations from OpenStreetMap.")
-        # Retrieve substations (additional nodes).
-        # These substations are used to *merge* lines that do not touch.
-        if len(edges) > 0:
-            substation_polygon = ops.transform(
-                MET2DEG,
-                edges.to_crs(PRJ_MET).buffer(2 * substation_distance, resolution=2).union_all(),
-            )
-            log.info("get nodes")
-            substations = retrieve_nodes(keys={"power": ["substation"]}, polygon=substation_polygon)
-            log.info("add substations fuzzily")
-            if len(substations) > 0:
-                substations = cluster_points(substations, distance=substation_distance)
-                edges = add_fuzzy_nodes(substations, edges, distance=substation_distance)
-    log.info("Build graph")
-    graph = Graph(
-        edges=edges,
-        region=gpd.GeoDataFrame([{"region": 0}], geometry=[enclosing_polygon], crs=PRJ_DEG),
-    )
-
     log.info("Get nodes from edges extremes.")
-    graph = graph.nodes_from_edges(node_prefix=node_prefix)
 
     log.info("Get power plants.")
-    powerplants = retrieve_nodes(keys={"power": ["plant"]}, polygon=enclosing_polygon)
-    powerplants = powerplants[
-        powerplants.columns.intersection(
-            [
-                "id",
-                "addr_city",
-                "frequency",
-                "generator_capacity",
-                "geometry",
-                "name",
-                "operator",
-                "owner",
-                "plant_method",
-                "plant_output",
-                "plant_source",
-                "plant_storage",
-                "plant_type",
-                "power",
-                "source",
-                "type",
-                "underground",
-                "voltage",
-                "voltage",
-            ]
-        )
-    ]
+    powerplants = retrieve_nodes(
+        osm_dump_file_nodes,
+        keys={"power": ["plant"]},
+        node_prefix=f"powerplant_{node_prefix}_",
+        polygon=enclosing_polygon,
+        columns=[
+            "id",
+            "addr_city",
+            "frequency",
+            "generator_capacity",
+            "geometry",
+            "name",
+            "operator",
+            "owner",
+            "plant_method",
+            "plant_output",
+            "plant_source",
+            "plant_storage",
+            "plant_type",
+            "power",
+            "source",
+            "type",
+            "underground",
+            "voltage",
+            "voltage",
+        ],
+    )
 
-    return graph, powerplants
+    return graph.to_degree(), powerplants.to_degree()
 
 
 def retrieve_nodes(
@@ -382,7 +403,7 @@ def retrieve_edges(
     """
     log.info("Retrieving `LineString` data from OpenStreetMap.")
     data = retrieve_data(
-        osm_dump_file=osm_dump_file, keys=keys, polygon=polygon, columns=columns, layer="lines"
+        osm_dump_file=osm_dump_file, keys=keys, polygon=polygon, columns=columns, layer="ways"
     )
 
     # Build a dataframe
@@ -416,7 +437,7 @@ def retrieve_data(
     keys: dict | None = None,
     polygon: geometry.Polygon | geometry.MultiPolygon | None = None,
     columns: list[str] | None = None,
-    layer: Literal["points", "lines"] = "points",
+    layer: Literal["points", "ways"] = "points",
 ) -> gpd.GeoDataFrame:
     """Get the raw data."""
     # load data from osm dump file
@@ -496,13 +517,34 @@ class Base:
         return self
 
     def subsumple(
-        self, predicate: Literal["within", "intersects"], shape: shapely.Geometry
+        self,
+        predicate: Literal["within", "intersects"],
+        shape: shapely.Geometry,
+        invert: bool = False,
     ) -> gpd.GeoDataFrame:
-        """Sub-sample objects based on `shape`."""
+        """Sub-sample objects based on `shape`.
+
+        Parameters
+        ==========
+        predicate : str
+            the predicate to check
+        shape : shapely.Geometry
+            the geometry to test against
+        invert: bool
+            whether to invert the match or not
+
+        Return
+        ======
+        Output : GeoDataFrame
+            The subset of objects
+        """
         if predicate == "within":
             allowed = self.data.geometry.within(shape)
         elif predicate == "intersects":
             allowed = self.data.geometry.intersects(shape)
+
+        if invert:
+            return self.data.loc[~allowed]
         return self.data.loc[allowed]
 
     @property
@@ -512,6 +554,18 @@ class Base:
     @property
     def index(self) -> pd.Index:
         return self.data.index
+
+    @property
+    def columns(self) -> pd.Index:
+        return self.data.columns
+
+    def rename(self, columns: dict | None = None, index: dict | None = None) -> Self:
+        return type(self)(
+            gpd.GeoDataFrame(self.data.rename(index=index, columns=columns), crs=self.crs)
+        )
+
+    def dropna(self, **kwargs) -> Self:
+        return type(self)(gpd.GeoDataFrame(self.data.dropna(**kwargs), crs=self.crs))
 
     def __len__(self):
         return len(self.data)
@@ -757,7 +811,7 @@ class Edges(Base):
         dup_indx = pd.Index([frozenset([e.source, e.target]) for _, e in self.data.iterrows()])
         return Edges(self.data.loc[~dup_indx.duplicated()])
 
-    def rename(self, rename_dict: dict) -> Edges:
+    def rename_nodes(self, rename_dict: dict) -> Edges:
         """Rename source and target from dict.
 
         Nodes in keys will be replaced with the corresponding value.
@@ -851,6 +905,19 @@ class Graph:
 
         Add nodes as source and targets and eventually split edges accordingly.
         Will overwrite existing nodes if overlapping.
+
+        Parameters:
+        ----------
+        nodes : Nodes
+            There are the nodes to be added
+        max_distance : float
+            If nodes are within this distance from an edge, this edge is split and the node becomes the source or target.
+        max_distance_bounds : float
+            If the node is within this distance from an edge border is substitute the formed source or target node.
+        Returns
+        -------
+        new_graph : Graph
+            The new graph with additional nodes.
         """
         log.info(f"Adding {len(nodes)} nodes to the edges within {max_distance} meters")
 
@@ -940,7 +1007,7 @@ class Graph:
         rename = {k: v for v, nns in nodes.items() for k in nns if k != v}
 
         new_nodes = self.nodes.drop(index=list(rename.keys()))
-        new_edges = self.edges.rename(rename)
+        new_edges = self.edges.rename_nodes(rename)
         return Graph(edges=new_edges, region=self.region, nodes=new_nodes)
 
     def filter_edges(self, keep_ids: list | np.ndarray | pd.Index) -> Graph:
@@ -1002,86 +1069,16 @@ class Graph:
         g_outer = self.filter_edges(crossing_ids)
         return g_inner, g_outer
 
-    def merge_edges(self, other: Graph) -> Graph:
-        """Merge the edges of two `Graph` and adapt nodes accordingly.
+    def overlapping_nodes(self, other: Graph) -> Generator[tuple]:
+        """Find overlapping nodes between two graphs.
 
-        1. Find edges in self that covers edges in other
-        2. Find edges in other that covers edges is self
-        3. Remove them (identical edges should be taken only once)
-        4. Rename the nodes.
+        We assume no overlapping nodes are present on each Graph.
         """
-        all_nodes = pd.concat([self.nodes.data, other.nodes.data])
-        all_edges = pd.concat([self.edges.data, other.edges.data], ignore_index=True)
-        all_edge_sindex = shapely.STRtree(all_edges.geometry)
-
-        used = set()
-        keep_edges = set()
-        transform_edges = []
-        rename_nodes = {}
-
-        for edgeid, edge in all_edges.geometry.items():
-            if edgeid in used:
-                continue
-
-            # fetch all edges contained in this one
-            contains_idx = set(all_edge_sindex.query(edge, predicate="contains"))
-            involved = contains_idx - {edgeid}
-
-            if len(involved) > 0:
-                involved.add(edgeid)
-                used |= involved
-
-                involved_edges = all_edges.loc[list(involved)]
-                involved_nodes = all_nodes.loc[
-                    pd.concat([involved_edges.source, involved_edges.target])
-                ].rename(index=rename_nodes)
-                involved_nodes = involved_nodes.loc[~involved_nodes.index.duplicated()]
-                nodes = [sorted(n.index) for _, n in involved_nodes.groupby("geometry")]
-                new_renames = {nn: n[0] for n in nodes if len(n) > 1 for nn in n[1:]}
-                rename_nodes |= new_renames
-
-                # remove newly added renames
-                involved_nodes = involved_nodes.rename(index=new_renames)
-                involved_nodes = involved_nodes.loc[~involved_nodes.index.duplicated()]
-
-                # split the containing edge by the points
-                new_lines = align_line_points(edge, gpd.GeoDataFrame(involved_nodes))
-                for k, v in all_edges.loc[edgeid].items():
-                    if k not in {"geometry", "source", "target"}:
-                        new_lines[k] = v
-                transform_edges.append(new_lines)
-                keep_edges -= involved
-
-            else:
-                keep_edges.add(edgeid)
-
-        # Almost overlapping nodes:
-        sindex = shapely.STRtree(self.nodes.data.geometry)
-        rename_overlapping_nodes = {
-            id_node: self.nodes.index[sindex.query_nearest(node, max_distance=1e-6)]
-            for id_node, node in other.nodes.data.geometry.items()
-        }
-        rename_overlapping_nodes = {
-            k: v[0] for k, v in rename_overlapping_nodes.items() if len(v) > 0
-        }
-        rename_nodes |= rename_overlapping_nodes
-
-        g = Graph(
-            edges=Edges(
-                gpd.GeoDataFrame(
-                    pd.concat([all_edges.iloc[list(keep_edges)]] + transform_edges),
-                    crs=self.edges.crs,
-                )
-            ),
-            region=gpd.GeoDataFrame(pd.concat([self.region, other.region]), crs=self.region.crs),
-        )
-        g.edges.data.source = g.edges.data["source"].apply(lambda x: rename_nodes.get(x, x))
-        g.edges.data.target = g.edges.data["target"].apply(lambda x: rename_nodes.get(x, x))
-        all_nodes = all_nodes.rename(index=rename_nodes)
-        all_nodes = all_nodes[~all_nodes.index.duplicated()]
-
-        g.nodes.append(Nodes(gpd.GeoDataFrame(all_nodes)))
-        return g
+        tree = shapely.STRtree(self.nodes.data.geometry)
+        for nid, node in other.nodes.data.iterrows():
+            match = tree.query_nearest(node.geometry, max_distance=1e-10)
+            if len(match) > 0:
+                yield (self.nodes.index[match[0]], nid)
 
     def merge(self, other: Graph, tol: float = 50) -> Graph:
         """Blend and merge two graphs into one.
@@ -1091,19 +1088,28 @@ class Graph:
         3. Rename nodes
         """
         region1 = self.region_shape
-        region2 = other.region_shape
+        region2 = other.region_shape.difference(region1)
+
+        # Merge overlapping nodes
+        # ov_nodes = dict(self.overlapping_nodes(other))
+        # self.nodes.data = self.nodes.data.rename(
+        #     index={x: ov_nodes.get(x, x) for x in self.nodes.index}
+        # )
+        # self.edges = self.edges.rename(ov_nodes)
 
         # nodes that are inside their regions
-        nodes_allowed_1 = self.nodes.subsumple("within", region1)
-        nodes_allowed_2 = other.nodes.subsumple("within", region2)
+        nodes_allowed_1 = self.nodes.subsumple("within", region1, invert=False)
+        nodes_allowed_2 = other.nodes.subsumple("within", region2, invert=False)
         nodes_suspicious_1 = self.nodes.subsumple("within", region2)
         nodes_suspicious_2 = other.nodes.subsumple("within", region1)
 
-        e1 = self.edges.subsumple("intersects", region2)
-        e2 = other.edges.subsumple("intersects", region1)
+        e1 = self.edges.subsumple("intersects", region1.boundary)
+        e2 = other.edges.subsumple("intersects", region2.boundary)
         tree = shapely.STRtree(e2.geometry)
 
-        new = {"lines": [], "old": []}
+        g = []
+
+        new = {"lines": [], "old1": [], "old2": []}
         for id1, edge1 in tqdm.tqdm(e1.iterrows(), total=len(e1), leave=False):
             nearest = e2.iloc[
                 tree.query_nearest(
@@ -1114,6 +1120,7 @@ class Graph:
             # for all edges of other coming close enough
             # check if a link is possible.
             for id2, edge2 in nearest.iterrows():
+                log = "ITA.18_1_14" in [edge1.target, edge2.target, edge1.source, edge2.source]
                 inner = []
                 if edge1["source"] in nodes_allowed_1.index:
                     inner.append(edge1["source"])
@@ -1124,36 +1131,44 @@ class Graph:
                 if edge2["target"] in nodes_allowed_2.index:
                     inner.append(edge2["target"])
 
-                if len(inner) != 2:
-                    # This case might be one where the line intersect the region
-                    # but the nodes are external
-                    # Just drop those edges
-                    new["old"].append(id1)
-                    new["old"].append(id2)
-
-                else:
-                    l1 = edge1.geometry.intersection(region1)
-                    l2 = edge2.geometry.intersection(region2)
+                if len(inner) == 2:
+                    if log:
+                        g.append(
+                            (
+                                edge1.geometry,
+                                edge2.geometry,
+                                mmerge_lines(edge1.geometry, edge1.geometry),
+                            )
+                        )
                     metadata1 = edge1.dropna().to_dict()
                     metadata2 = edge2.dropna().to_dict()
                     metadata1.update(metadata2)
-                    metadata1["geometry"] = shapely.union_all([l1, l2])
+                    # metadata1["geometry"] = shapely.union_all([l1, l2])
+                    metadata1["geometry"] = mmerge_lines(edge1.geometry, edge2.geometry)
                     metadata1["source"] = min(inner)
                     metadata1["target"] = max(inner)
                     new["lines"].append(metadata1)
-                    new["old"].append(id1)
-                    new["old"].append(id2)
+                new["old1"].append(id1)
+                new["old2"].append(id2)
 
-        old_edges = pd.Index(new["old"])
+        # edges to be removed because they are substituted by the merged ones
+        old1_edges = pd.Index(new["old1"])
         oe = self.edges.nodes(nodes_suspicious_1.index)
-        old_edges = old_edges.union(oe.index.tolist())
+        old1_edges = old1_edges.union(oe.index.tolist())
+        old2_edges = pd.Index(new["old2"])
         oe = other.edges.nodes(nodes_suspicious_2.index)
-        old_edges = old_edges.union(oe.index.tolist())
+        old2_edges = old2_edges.union(oe.index.tolist())
+
+        if len(g) > 0:
+            print("writing")
+            gpd.GeoSeries([x[0] for x in g], crs=PRJ_MET).to_crs(PRJ_DEG).to_file("xxx_e1.gpkg")
+            gpd.GeoSeries([x[1] for x in g], crs=PRJ_MET).to_crs(PRJ_DEG).to_file("xxx_e2.gpkg")
+            gpd.GeoSeries([x[2] for x in g], crs=PRJ_MET).to_crs(PRJ_DEG).to_file("xxx_merged.gpkg")
 
         new_edges = Edges.concat(
             [
-                self.edges.drop(index=old_edges, errors="ignore"),
-                other.edges.drop(index=old_edges, errors="ignore"),
+                self.edges.drop(index=old1_edges, errors="ignore"),
+                other.edges.drop(index=old2_edges, errors="ignore"),
             ],
             crs=self.edges.crs,
         )
@@ -1247,19 +1262,31 @@ class Graph:
 
         assert len(set(subset) - set(nodes)) == 0, f"Not included {set(subset) - set(nodes)}"
 
-        i = 0
-        for component in tqdm.tqdm(self.connected_components, desc="Short paths"):
-            indx = subset.intersection(component)
-            i += 1
-            if len(indx) < 2:
-                continue
-            for node in tqdm.tqdm(indx, desc=f"Component {i}"):
-                for path in graph_ig.get_shortest_paths(
-                    node, [x for x in indx if x > node], weights="weight", mode="all"
-                ):
-                    if len(path) == 0 or path is None:
-                        continue
+        if False:
+            # parallel processing requires a lot of memory
+            for paths in process_map(
+                partial(__yield_shortest_paths__, graph=graph_ig, subset=subset),
+                self.connected_components,
+            ):
+                yield from [nodes[path] for path in paths]
+        else:
+            i = 0
+            for component in tqdm.tqdm(self.connected_components, desc="Short paths"):
+                for path in __yield_shortest_paths__(component, graph_ig, subset):
                     yield nodes[path]
+                # indx = subset.intersection(component)
+                # i += 1
+                #
+                # if len(indx) < 2:
+                #     continue
+                #
+                # for node in tqdm.tqdm(indx, desc=f"Component {i}"):
+                #     for path in graph_ig.get_shortest_paths(
+                #         node, to=[x for x in indx if x > node], weights="weight", mode="all"
+                #     ):
+                #         if len(path) == 0 or path is None:
+                #             continue
+                #         yield nodes[path]
 
     def clean_disconnected_nodes(self) -> Graph:
         n = self.nodes.data
@@ -1688,7 +1715,8 @@ def check_smooth(l1: shapely.LineString, l2: shapely.LineString) -> bool:
         sub_l1 = segment(l1, -2).reverse()
         sub_l2 = segment(l2, -2).reverse()
     else:
-        return False
+        # cannot decide
+        return True
 
     p1 = np.array(sub_l1.coords)
     p1 = p1[1] - p1[0]
@@ -1906,6 +1934,82 @@ def concat(
     return gpd.GeoDataFrame(
         pd.concat(gdfs, ignore_index=ignore_index, axis="index"), geometry=geometry, crs=crs
     )
+
+
+def merge_lines(
+    l1: shapely.LineString, l2: shapely.LineString, force_joint: bool = False
+) -> shapely.LineString | shapely.MultiLineString:
+    """Merge lines two lines discarding the overlapping part.
+
+    force_join imply, add the segment that join separated lines.
+    """
+    # Find the nearest points between l1 and l2
+    point_on_l1, point_on_l2 = ops.nearest_points(l1, l2)
+
+    l1_p1_pos = l1.line_locate_point(point_on_l1)
+    p1 = shapely.Point(l1.coords[0])
+    p2 = shapely.Point(l1.coords[-1])
+    l1_p2_pos = (
+        l1.line_locate_point(p1) if l2.distance(p1) > l2.distance(p2) else l1.line_locate_point(p2)
+    )
+
+    l2_p1_pos = l2.line_locate_point(point_on_l2)
+    p1 = shapely.Point(l2.coords[0])
+    p2 = shapely.Point(l2.coords[-1])
+    l2_p2_pos = (
+        l2.line_locate_point(p1) if l1.distance(p1) > l1.distance(p2) else l2.line_locate_point(p2)
+    )
+
+    lines = []
+    newline = ops.substring(l1, l1_p1_pos, l1_p2_pos)
+    if isinstance(newline, shapely.LineString):
+        lines.append(newline)
+    if force_joint and point_on_l1 != point_on_l2:
+        lines.append(
+            shapely.LineString(
+                [l1.line_interpolate_point(l1_p1_pos), l2.line_interpolate_point(l2_p1_pos)]
+            )
+        )
+    newline = ops.substring(l2, l2_p2_pos, l2_p1_pos)
+    if isinstance(newline, shapely.LineString):
+        lines.append(newline)
+
+    return ops.linemerge(lines)
+
+
+def mmerge_lines(
+    l1: shapely.LineString | shapely.MultiLineString,
+    l2: shapely.LineString | shapely.MultiLineString,
+) -> shapely.LineString:
+    """Merge [Multi]lines."""
+    lines = list(l1.geoms) if isinstance(l1, shapely.MultiLineString) else [l1]
+    lines += list(l2.geoms) if isinstance(l2, shapely.MultiLineString) else [l2]
+
+    lines = shapely.MultiLineString(lines)
+
+    merged = pygeoops.centerline(lines.buffer(50, cap_style=2), min_branch_length=-2, extend=True)
+    if isinstance(merged, (shapely.LineString, shapely.MultiLineString)):
+        return merged
+    return lines
+
+
+def __yield_shortest_paths__(
+    component: Iterable, graph: ig.Graph, subset: pd.Index
+) -> list[pd.Index]:
+    nodes = subset.intersection(component)
+    paths = []
+    if len(nodes) < 2:
+        return paths
+
+    for node in nodes:
+        for path in graph.get_shortest_paths(
+            node, to=[x for x in nodes if x > node], weights="weight", mode="all"
+        ):
+            if len(path) == 0 or path is None:
+                continue
+            paths.append(path)
+
+    return paths
 
 
 check_cache_size()
