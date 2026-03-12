@@ -15,7 +15,9 @@ import pandas as pd
 
 def build_query(
     pbf_file: Path,
-    kind: Literal["railway", "power_distribution"] = "railway",
+    kind: Literal[
+        "railway", "power_distribution", "roads_motorway", "roads_primary", "roads_secondary"
+    ] = "railway",
     geom: Literal["points", "lines"] = "lines",
 ) -> str:
     """Build the query to perform on the database."""
@@ -38,6 +40,12 @@ def build_query(
             "substation": ["minor_distribution"],
             "power": ["substation"],
         }
+    elif kind == "roads_motorway" and geom == "lines":
+        tags = {"highway": ["motorway", "trunk", "motorway_link", "trunk_link"]}
+    elif kind == "roads_primary" and geom == "lines":
+        tags = {"highway": ["primary", "primary_link"]}
+    elif kind == "roads_secondary" and geom == "lines":
+        tags = {"highway": ["secondary", "secondary_link"]}
     else:
         raise NotImplementedError()
 
@@ -111,17 +119,7 @@ def build_query(
                 AND (tags['construction'] IS NULL OR tags['construction'] NOT IN ('proposed', 'planned'))
         )
 
-        -- Step 3: Unnest way-node relationships for ordering
-        -- way_nodes AS (
-        --     SELECT
-        --         w.id AS way_id,
-        --         w.tags,
-        --         UNNEST(w.refs) AS node_id,
-        --         UNNEST(generate_series(1, array_length(w.refs))) AS node_order
-        --     FROM filtered_ways w
-        -- )
-
-    -- Step 4: Final geometry construction
+    -- Step 2: Final geometry construction
     SELECT
         n.id AS id,
         n.tags,
@@ -149,9 +147,9 @@ def togdf(query: str, explode: int = 50):
         con.execute("LOAD spatial;")
 
         # Performance tuning for M3 Max
-        con.execute("SET threads=16;")  # M3 Max with 16 perf. cores
-        con.execute("SET memory_limit='24GB';")  # Dont even need all that 128Gb RAM!
-        con.execute("SET max_memory='24GB';")
+        con.execute("SET threads=8;")  # M3 Max with 16 perf. cores
+        con.execute("SET memory_limit='30GB';")  # Dont even need all that 128Gb RAM!
+        con.execute("SET max_memory='30GB';")
         con.execute("SET temp_directory='./tmp';")
         con.execute("SET enable_progress_bar=true;")
 
@@ -186,18 +184,28 @@ def togdf(query: str, explode: int = 50):
 pbf_file = Path("~/curro/working_data/osm_sources/europe-latest.osm.pbf").expanduser()
 # pbf_file = Path("~/Downloads/albania-260210.osm.pbf").expanduser()
 
+if False:  # power_distribution
+    gdf = pd.concat(
+        [
+            togdf(build_query(pbf_file, kind="power_distribution", geom="points")),
+            togdf(build_query(pbf_file, kind="power_distribution", geom="lines")),
+        ],
+        axis=0,
+    )
+    gdf.geometry = gdf.geometry.representative_point()
 
-gdf = pd.concat(
-    [
-        togdf(build_query(pbf_file, kind="power_distribution", geom="points")),
-        togdf(build_query(pbf_file, kind="power_distribution", geom="lines")),
-    ],
-    axis=0,
-)
-gdf.geometry = gdf.geometry.representative_point()
-gdf.to_file("power_distribution.gpkg")
+if True:  # roads
+    gdf = togdf(build_query(pbf_file, kind="roads_motorway", geom="lines"))
+    gdf = gpd.GeoDataFrame(
+        pd.concat([gdf, togdf(build_query(pbf_file, kind="roads_primary", geom="lines"))]),
+        crs=gdf.crs,
+    )
+    gdf = gpd.GeoDataFrame(
+        pd.concat([gdf, togdf(build_query(pbf_file, kind="roads_secondary", geom="lines"))]),
+        crs=gdf.crs,
+    )
+    gdf.to_file(Path("EU_roads.gpkg"), driver="GPKG", layer="lines", mode="w")
 exit()
-
 gdf = togdf(build_query(pbf_file, kind="railway", geom="points"))
 gdf.to_file(Path("EU_railways.gpkg"), driver="GPKG", layer="points", mode="w")
 gdf = togdf(build_query(pbf_file, kind="railway", geom="lines"))
