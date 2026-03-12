@@ -12,7 +12,7 @@ from functools import partial
 from itertools import combinations
 from numbers import Number
 from pathlib import Path
-from typing import Generator, Hashable, Iterable, Literal, Self
+from typing import Hashable, Iterable, Literal, Self
 
 import geopandas as gpd
 import igraph as ig
@@ -24,8 +24,9 @@ import pygeoops
 import pyproj
 import shapely
 import tqdm
-from matplotlib import axes
-from shapely import geometry, ops, plotting
+from scipy import sparse
+from scipy.sparse import csgraph
+from shapely import geometry, ops
 from sklearn.cluster import DBSCAN
 from tqdm.contrib.concurrent import process_map
 
@@ -144,7 +145,7 @@ def osm_railways(
     graph = graph.add_nodes(nodes, max_distance=300, max_distance_bounds=10)
 
     # Remove nodes that do not belong to any edge
-    graph = graph.clean_disconnected_nodes()
+    graph = graph.drop_disconnected_nodes()
     nodes = Nodes(nodes.data.loc[nodes.index.intersection(graph.nodes.index)])
 
     # merge stations into meta-stations
@@ -167,6 +168,62 @@ def osm_railways(
         avoid_distance=300,  # do not increase too much
         force_smooth=True,
     )
+    return graph.to_degree()
+
+
+def osm_roads(
+    place: geometry.Polygon | geometry.MultiPolygon,
+    osm_dump_file: str | Path | tuple[str | Path, str | Path],
+    node_prefix: str = "",
+) -> Graph:
+    """Retrieve the power-line network.
+
+    Parameters
+    ----------
+    place: str | geometry.Polygon | geometry.MultiPolygon
+        Retrieve data from this place: e.g. `Padova`, `London`, `France`… or a `[Multi]Polygon`.
+    node_prefix :  str
+        A prefix for the nodes.
+
+    Returns
+    -------
+    graph : Graph
+        nodes and edges
+    """
+    # Retrieving the enclosing polygon.
+    enclosing_polygon = place
+    if enclosing_polygon.area > 10:
+        log.warning(f"Area of size {enclosing_polygon.area}")
+    else:
+        log.info(f"Area of size {enclosing_polygon.area}")
+
+    # get file location
+    if isinstance(osm_dump_file, (str, Path)):
+        osm_dump_file_nodes = osm_dump_file
+        osm_dump_file_edges = osm_dump_file
+    else:
+        osm_dump_file_nodes, osm_dump_file_edges = osm_dump_file
+
+    # Retrieve lines from `OpenStreetMap`.
+    graph = retrieve_edges(
+        osm_dump_file=osm_dump_file_edges,
+        polygon=enclosing_polygon,
+        node_prefix=node_prefix,
+        split_when_touching=True,
+        layer="lines",
+    )
+    if len(graph.edges) == 0:
+        return graph
+
+    graph = graph.to_meters()
+    # merge nodes within 10 meters
+    graph = graph.aggregate_nodes(200)
+    graph.edges = graph.edges.drop_duplicated_edges().remove_self_loops()
+    graph = graph.complete_lines(
+        complete_to_boundary=True, complete_multilines=True
+    ).merge_chained_edges()
+
+    graph.edges.data = graph.edges.data.reset_index(drop=True)
     return graph.to_degree()
 
 
@@ -327,6 +384,7 @@ def retrieve_nodes(
     polygon: geometry.Polygon | geometry.MultiPolygon | None = None,
     columns: list[str] | None = None,
     node_prefix: str = "NODE_",
+    layer: str = "points",
 ) -> Nodes:
     """Retrieve node data from OpenStreetMap.
 
@@ -351,7 +409,7 @@ def retrieve_nodes(
     """
     log.info("Retrieving `Point` data from OpenStreetMap.")
     nodes = retrieve_data(
-        osm_dump_file=osm_dump_file, keys=keys, polygon=polygon, columns=columns, layer="points"
+        osm_dump_file=osm_dump_file, keys=keys, polygon=polygon, columns=columns, layer=layer
     )
     if len(nodes) == 0:
         return Nodes()
@@ -378,6 +436,7 @@ def retrieve_edges(
     columns: list[str] | None = None,
     node_prefix: str = "_tmp_",
     split_when_touching: bool | None = None,
+    layer: str = "ways",
 ) -> Graph:
     """Retrieve edge data from OpenStreetMap.
 
@@ -403,7 +462,7 @@ def retrieve_edges(
     """
     log.info("Retrieving `LineString` data from OpenStreetMap.")
     data = retrieve_data(
-        osm_dump_file=osm_dump_file, keys=keys, polygon=polygon, columns=columns, layer="ways"
+        osm_dump_file=osm_dump_file, keys=keys, polygon=polygon, columns=columns, layer=layer
     )
 
     # Build a dataframe
@@ -437,26 +496,21 @@ def retrieve_data(
     keys: dict | None = None,
     polygon: geometry.Polygon | geometry.MultiPolygon | None = None,
     columns: list[str] | None = None,
-    layer: Literal["points", "ways"] = "points",
+    layer: str = "points",
 ) -> gpd.GeoDataFrame:
     """Get the raw data."""
     # load data from osm dump file
-    data = gpd.read_file(
-        str(Path(osm_dump_file).expanduser()),
-        layer=layer,
-        # bbox=(12.5986, 47.719, 13.322, 48.1577),
-        # bbox=(13, 47.5, 14, 49),
-        # bbox=(13.0697, 47.8361, 13.4183, 48.0475),
-        mask=polygon,
-    ).explode()
+    print(layer)
+    data = gpd.read_file(str(Path(osm_dump_file).expanduser()), layer=layer, mask=polygon).explode()
 
     # expand tags
-    additional_tags = data["other_tags"].str.extractall(r'"(.*?)"=>"(.*?)"')
-    additional_tags = additional_tags.reset_index(level=0)
-    additional_tags = additional_tags.pivot(values=1, columns=0, index="level_0")
-    data = gpd.GeoDataFrame(
-        pd.concat([data, additional_tags], axis=1), geometry="geometry", crs=PRJ_DEG
-    )
+    if "other_tags" in data.columns:
+        additional_tags = data["other_tags"].str.extractall(r'"(.*?)"=>"(.*?)"')
+        additional_tags = additional_tags.reset_index(level=0)
+        additional_tags = additional_tags.pivot(values=1, columns=0, index="level_0")
+        data = gpd.GeoDataFrame(
+            pd.concat([data, additional_tags], axis=1), geometry="geometry", crs=PRJ_DEG
+        )
 
     # filter rows from `keys`
     if keys is not None:
@@ -839,6 +893,56 @@ class Edges(Base):
         self.drop_duplicates()
         return self
 
+    def merge_edges(self, edge_ids: Iterable[Iterable[Hashable]]) -> Edges:
+        """Merge listed edges."""
+        edges = self.data
+        edges["__label__"] = np.zeros(len(edges))
+        for icls, cls in enumerate(edge_ids):
+            edges.loc[list(cls), "__label__"] = icls + 1
+
+        edges = (
+            gpd.GeoDataFrame(
+                pd.concat(
+                    [edges[edges["__label__"] == 0]]
+                    + [_merge_edges_(e) for label, e in edges.groupby("__label__") if label > 0]
+                )
+            )
+            .set_crs(self.data.crs, allow_override=True)
+            .reset_index()
+            .drop(columns="__label__")
+        )
+        return Edges(edges)
+
+    def complete_lines(
+        self,
+        nodes: Nodes,
+        complete_to_boundary: bool | None = None,
+        complete_multilines: bool | None = None,
+    ) -> Edges:
+        new_geometries = []
+
+        new_geometries = process_map(
+            partial(
+                _complete_join_multilinestring_,
+                complete_multilines=complete_multilines,
+                complete_to_boundary=complete_to_boundary,
+            ),
+            [
+                (
+                    edge.geometry,
+                    nodes.data.loc[edge.loc["source"], "geometry"],
+                    nodes.data.loc[edge.loc["target"], "geometry"],
+                )
+                for _, edge in self.data.iterrows()
+            ],
+            chunksize=len(self.data) // 100 + 1,
+            desc="Joining MultiLineStrings",
+        )
+
+        edges = self.data
+        edges["geometry"] = new_geometries
+        return Edges(edges)
+
     @classmethod
     def concat(
         cls, gdfs: Iterable[Self], geometry="geometry", crs=PRJ_DEG, ignore_index: bool = True
@@ -896,6 +1000,7 @@ class Graph:
         )
 
     def index(self) -> pd.Index:
+        """Index of the edges (`self.edges.index`)"""
         return self.edges.index
 
     def add_nodes(
@@ -1059,26 +1164,15 @@ class Graph:
 
         return list(edges.keys())
 
-    def split_edges(self, other: Graph):
-        """Split edges in those intersecting the other.region and the others."""
-        # Edges in self, crossing to other.region
-        sindex = shapely.STRtree(self.edges.data.geometry)
-        crossing_ids = self.edges.index[sindex.query(other.region_shape, predicate="intersects")]
-
-        g_inner = self.filter_edges(self.index().difference(list(crossing_ids)))
-        g_outer = self.filter_edges(crossing_ids)
-        return g_inner, g_outer
-
-    def overlapping_nodes(self, other: Graph) -> Generator[tuple]:
-        """Find overlapping nodes between two graphs.
-
-        We assume no overlapping nodes are present on each Graph.
-        """
-        tree = shapely.STRtree(self.nodes.data.geometry)
-        for nid, node in other.nodes.data.iterrows():
-            match = tree.query_nearest(node.geometry, max_distance=1e-10)
-            if len(match) > 0:
-                yield (self.nodes.index[match[0]], nid)
+    # def split_edges(self, other: Graph):
+    #     """Split edges in those intersecting the other.region and the others."""
+    #     # Edges in self, crossing to other.region
+    #     sindex = shapely.STRtree(self.edges.data.geometry)
+    #     crossing_ids = self.edges.index[sindex.query(other.region_shape, predicate="intersects")]
+    #
+    #     g_inner = self.filter_edges(self.index().difference(list(crossing_ids)))
+    #     g_outer = self.filter_edges(crossing_ids)
+    #     return g_inner, g_outer
 
     def merge(self, other: Graph, tol: float = 50) -> Graph:
         """Blend and merge two graphs into one.
@@ -1089,13 +1183,6 @@ class Graph:
         """
         region1 = self.region_shape
         region2 = other.region_shape.difference(region1)
-
-        # Merge overlapping nodes
-        # ov_nodes = dict(self.overlapping_nodes(other))
-        # self.nodes.data = self.nodes.data.rename(
-        #     index={x: ov_nodes.get(x, x) for x in self.nodes.index}
-        # )
-        # self.edges = self.edges.rename(ov_nodes)
 
         # nodes that are inside their regions
         nodes_allowed_1 = self.nodes.subsumple("within", region1, invert=False)
@@ -1189,7 +1276,7 @@ class Graph:
             region=concat([self.region, other.region], crs=self.region.crs),
             nodes=Nodes.concat([self.nodes, other.nodes], crs=self.nodes.crs),
         )
-        return new_graph.clean_disconnected_nodes()
+        return new_graph.drop_disconnected_nodes()
 
     def __str__(self) -> str:
         return "\n".join(map(str, [self.edges, self.nodes]))
@@ -1267,46 +1354,59 @@ class Graph:
             for paths in process_map(
                 partial(__yield_shortest_paths__, graph=graph_ig, subset=subset),
                 self.connected_components,
+                chunksize=10,
             ):
                 yield from [nodes[path] for path in paths]
         else:
-            i = 0
             for component in tqdm.tqdm(self.connected_components, desc="Short paths"):
                 for path in __yield_shortest_paths__(component, graph_ig, subset):
                     yield nodes[path]
-                # indx = subset.intersection(component)
-                # i += 1
-                #
-                # if len(indx) < 2:
-                #     continue
-                #
-                # for node in tqdm.tqdm(indx, desc=f"Component {i}"):
-                #     for path in graph_ig.get_shortest_paths(
-                #         node, to=[x for x in indx if x > node], weights="weight", mode="all"
-                #     ):
-                #         if len(path) == 0 or path is None:
-                #             continue
-                #         yield nodes[path]
 
-    def clean_disconnected_nodes(self) -> Graph:
+    def drop_disconnected_nodes(self) -> Graph:
         n = self.nodes.data
-        n = n.loc[sorted(set(self.edges.data["source"]) | set(self.edges.data["target"]))]
+        n = n.loc[sorted(set(self.edges.source) | set(self.edges.target))]
         return Graph(edges=self.edges, region=self.region, nodes=Nodes(n))
 
-    def plot(self, ax: axes.Axes, color: str = "r", text_args: dict | None = None):
-        plotting.plot_polygon(self.region_shape, color=color, ax=ax, alpha=0.2)
-        plotting.plot_line(self.edges.data.union_all(), color=color, ax=ax, alpha=0.3)
-        if hasattr(self, "nodes"):
-            plotting.plot_points(
-                self.nodes.data.union_all(), ax=ax, color=color, alpha=0.5, markersize=10
-            )
+    def complete_lines(
+        self, complete_to_boundary: bool | None = None, complete_multilines: bool | None = None
+    ) -> Graph:
+        """Complete links such that they touch the source and target nodes."""
+        return Graph(
+            self.edges.complete_lines(
+                self.nodes,
+                complete_to_boundary=complete_to_boundary,
+                complete_multilines=complete_multilines,
+            ),
+            region=self.region,
+            nodes=self.nodes,
+        )
 
-            for x, y, name in zip(
-                self.nodes.data.geometry.x, self.nodes.data.geometry.y, self.nodes.index
-            ):
-                text_args = {} if text_args is None else text_args
-                ax.annotate(name, (x, y), xytext=(x, y + 1), **text_args)
-        ax.grid()
+    def merge_chained_edges(self) -> Graph:
+        """Join chained edges adsorbing nodes with degree = 2."""
+        deg = self.degree()
+        # get only nodes with degree two.
+        deg = deg[deg == 2]
+
+        edges = self.edges.data[
+            (self.edges.source.isin(deg.index) | self.edges.target.isin(deg.index))
+        ]
+        linked_edges = {}
+        for eid, edge in edges.reset_index().iterrows():
+            if edge.source in deg.index:
+                linked_edges.setdefault(edge.source, []).append(eid)
+            if edge.target in deg.index:
+                linked_edges.setdefault(edge.target, []).append(eid)
+
+        gr = ig.Graph(edges=list(linked_edges.values()))
+        new_edges = self.edges.merge_edges([edges.index[cc] for cc in gr.connected_components()])
+        return Graph(new_edges, region=self.region, nodes=self.nodes).drop_disconnected_nodes()
+
+    def degree(self) -> pd.Series:
+        """Degree of the nodes."""
+        n1 = self.edges.source.value_counts()
+        n2 = self.edges.target.value_counts()
+
+        return n1.add(n2, fill_value=0.0)
 
 
 def _clean_voltage(voltage: pd.Series) -> pd.Series:
@@ -2010,6 +2110,119 @@ def __yield_shortest_paths__(
             paths.append(path)
 
     return paths
+
+
+def _complete_line_(
+    line: shapely.LineString | shapely.MultiLineString, p1: shapely.Point, p2: shapely.Point
+) -> shapely.LineString | shapely.MultiLineString:
+    closest1 = min(line.boundary.geoms, key=lambda x: shapely.distance(p1, x))
+    closest2 = min(line.boundary.geoms, key=lambda x: shapely.distance(p2, x))
+
+    segment1 = shapely.LineString([p1, closest1])
+    segment2 = shapely.LineString([p2, closest2])
+
+    if isinstance(line, shapely.LineString):
+        return ops.linemerge([segment1, line, segment2]).simplify(1e-10)
+
+    return ops.linemerge(list(line.geoms) + [segment1, segment2]).simplify(1e-10)
+
+
+def _join_multilinestring_(
+    multiline: shapely.MultiLineString | shapely.LineString,
+) -> shapely.LineString:
+    """Join MultiLineStrings adding missing segments."""
+    if isinstance(multiline, shapely.LineString):
+        return multiline
+
+    # construct the graph of lines
+    boundaries = [(iline, line.boundary) for iline, line in enumerate(multiline.geoms)]
+
+    if len(boundaries) == 2:
+        # if only two lines, that's easy
+        tomerge = [(1.0, 0, 1)]
+    else:
+        # compute the minimum spanning tree
+        dist = np.array(
+            [(shapely.distance(x[1], y[1]), x[0], y[0]) for x, y in combinations(boundaries, 2)]
+        )
+        sparse_graph = sparse.coo_matrix(
+            (dist[:, 0], (dist[:, 1], dist[:, 2])), shape=(len(boundaries), len(boundaries))
+        )
+        mstree = csgraph.minimum_spanning_tree(sparse_graph + sparse_graph.T)
+
+        # assume the minimum spanning tree best represent the line
+        tomerge = sorted(zip(mstree.data, *mstree.nonzero()))
+
+    lines = list(multiline.geoms)
+    segments = []
+    used = set()
+    for w, i, j in tomerge:
+        line1 = lines[i]
+        line2 = lines[j]
+        closest1 = min(line1.boundary.geoms, key=lambda x: shapely.distance(line2.boundary, x))
+        if closest1 in used:
+            # this is to force the topology to be a line
+            # avoiding branches
+            closest1 = max(line1.boundary.geoms, key=lambda x: shapely.distance(line2.boundary, x))
+        used.add(closest1)
+
+        closest2 = min(line2.boundary.geoms, key=lambda x: shapely.distance(line1.boundary, x))
+        if closest2 in used:
+            closest2 = max(line2.boundary.geoms, key=lambda x: shapely.distance(line1.boundary, x))
+        used.add(closest2)
+
+        segment = shapely.LineString([closest1, closest2])
+        segments.append(segment)
+
+    return ops.linemerge(lines + segments).simplify(1e-10)
+
+
+def _complete_join_multilinestring_(
+    objects: tuple[shapely.LineString | shapely.MultiLineString, shapely.Point, shapely.Point],
+    complete_multilines: bool,
+    complete_to_boundary: bool,
+) -> shapely.LineString | shapely.MultiLineString:
+    new_edge, p1, p2 = objects
+
+    if complete_multilines:
+        new_edge = _complete_line_(new_edge, p1, p2)
+
+    if complete_to_boundary:
+        new_edge = _join_multilinestring_(new_edge)
+
+    return new_edge
+
+
+def _merge_edges_(to_merge: pd.DataFrame) -> pd.DataFrame:
+    # merge all geometries together
+    if len(to_merge) <= 1 or isinstance(to_merge, pd.Series):
+        return to_merge
+
+    geom_list = [
+        [line] if isinstance(line, shapely.LineString) else list(line.geoms)
+        for line in to_merge.geometry
+    ]
+    geom_list = [g for geom in geom_list for g in geom]
+
+    try:
+        new_edge_geom = ops.linemerge(geom_list)
+    except NotImplementedError:
+        print(to_merge)
+        raise
+
+    dd = pd.concat([to_merge["source"], to_merge["target"]]).value_counts()
+    dd = dd[dd == 1]
+    try:
+        assert len(dd) == 2
+    except AssertionError:
+        return to_merge
+    n1, n2 = dd.index
+    new_edge = to_merge.aggregate(mode)
+    new_edge["source"] = n1
+    new_edge["target"] = n2
+    new_edge["geometry"] = new_edge_geom
+
+    return new_edge.to_frame().T
 
 
 check_cache_size()
