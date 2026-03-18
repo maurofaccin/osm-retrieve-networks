@@ -538,12 +538,16 @@ class Base:
         yield from self.data.iterrows()
 
     def to_meters(self) -> Self:
+        if self.crs == PRJ_MET:
+            return self
         if len(self.data) == 0:
             return self
         data = self.data.to_crs(PRJ_MET)
         return type(self)(data)
 
     def to_degree(self, inline: bool = False) -> Self:
+        if self.crs == PRJ_DEG:
+            return self
         if len(self.data) == 0:
             return self
         data = self.data.to_crs(PRJ_DEG)
@@ -1062,6 +1066,7 @@ class Graph:
                 desc="Add nodes (find edges)",
             )
         )
+
         if "edgeid" not in edges.columns:
             log.warning("No nodes where close to an edge (check crs)")
             return self
