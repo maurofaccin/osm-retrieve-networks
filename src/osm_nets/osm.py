@@ -1068,7 +1068,9 @@ class Graph:
         )
 
         if "edgeid" not in edges.columns:
-            log.warning("No nodes where close to an edge (check crs)")
+            log.warning(
+                f"No nodes where close to an edge (check crs {self.nodes.crs} -- {nodes.crs})"
+            )
             return self
         # no edges close to the node
         edges = edges.dropna(subset="edgeid")
@@ -1312,17 +1314,16 @@ class Graph:
         return len(self.edges)
 
     @classmethod
-    def read(cls, path: Path, node_index: str | None = None) -> Graph:
-        edges = gpd.read_file(path, layer="edges").set_crs(PRJ_DEG, allow_override=True)
-        nodes = gpd.read_file(path, layer="nodes").set_crs(PRJ_DEG, allow_override=True)
+    def read(
+        cls, path: Path, node_index: str | None = None, crs: str | int | pyproj.CRS = PRJ_DEG
+    ) -> Graph:
+        edges = gpd.read_file(path, layer="edges").set_crs(crs, allow_override=True)
+        nodes = gpd.read_file(path, layer="nodes").set_crs(crs, allow_override=True)
         if node_index is not None:
             nodes = nodes.set_index(node_index, drop=True)
-        region = gpd.read_file(path, layer="region").set_crs(PRJ_DEG, allow_override=True)
+        region = gpd.read_file(path, layer="region").set_crs(crs, allow_override=True)
 
-        g = Graph(edges=Edges(edges), region=region, nodes=Nodes(nodes))
-        g.nodes.append(Nodes(nodes))
-
-        return g
+        return Graph(edges=Edges(edges), region=region, nodes=Nodes(nodes))
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
