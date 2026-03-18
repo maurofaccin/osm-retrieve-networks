@@ -16,7 +16,6 @@ from typing import Hashable, Iterable, Literal, Self
 
 import geopandas as gpd
 import igraph as ig
-import logconfig
 import numpy as np
 import osmnx as ox
 import pandas as pd
@@ -29,6 +28,8 @@ from scipy.sparse import csgraph
 from shapely import geometry, ops
 from sklearn.cluster import DBSCAN
 from tqdm.contrib.concurrent import process_map
+
+from osm_nets import logconfig
 
 CACHE = Path("~/.cache").expanduser() / "osm_retrieve_networks"
 CACHE.mkdir(parents=True, exist_ok=True)
