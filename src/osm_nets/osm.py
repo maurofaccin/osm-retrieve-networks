@@ -1473,7 +1473,9 @@ def graph_from_shortest_path(
     # nodes origin of links
     if isinstance(metanodes, pd.Index):
         points = graph.nodes.data.loc[metanodes]
-        avoid = gpd.GeoDataFrame([])
+        avoid = gpd.GeoDataFrame({"geometry": []}, geometry="geometry").set_crs(
+            PRJ_DEG, allow_override=True
+        )
         metanodes = pd.Series([[x] for x in metanodes], index=metanodes)
     elif isinstance(metanodes, pd.Series):
         points = graph.nodes.data.loc[metanodes.index]
@@ -2109,7 +2111,9 @@ def mmerge_lines(
 
     lines = shapely.MultiLineString(lines)
 
-    merged = pygeoops.centerline(lines.buffer(50, cap_style=2), min_branch_length=-2, extend=True)
+    merged = pygeoops.centerline(
+        lines.buffer(50, cap_style="flat"), min_branch_length=-2, extend=True
+    )
     if isinstance(merged, (shapely.LineString, shapely.MultiLineString)):
         return merged
     return lines
@@ -2162,6 +2166,7 @@ def __yield_shortest_paths__(
 def _complete_line_(
     line: shapely.LineString | shapely.MultiLineString, p1: shapely.Point, p2: shapely.Point
 ) -> shapely.LineString | shapely.MultiLineString:
+    """Complete line with segments to the points p1 and p2."""
     closest1 = min(line.boundary.geoms, key=lambda x: shapely.distance(p1, x))
     closest2 = min(line.boundary.geoms, key=lambda x: shapely.distance(p2, x))
 
