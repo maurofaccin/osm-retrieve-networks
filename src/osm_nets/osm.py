@@ -880,9 +880,15 @@ class Edges(Base):
         edges.target = edges.target.replace(rename_dict)
         return Edges(edges)
 
-    def cleanup(self) -> Edges:
+    def cleanup(self, cycles: Literal["ignore", "fix", "drop"] = "drop") -> Edges:
         # remove MultiLineString if possible
         self.data.geometry = self.data.normalize().line_merge()
+        # In the following we try to break some cycles
+        # in particular those that are self-touching
+        self.data.geometry = [
+            shapely.unary_union(g) if shapely.is_empty(g.boundary) else g
+            for g in self.data.geometry
+        ]
 
         if "source" in self.data.columns or "target" in self.data.columns:
             log.warning("Cleaning but not exploding. (`source` and `target` should be recomputed)")
@@ -893,7 +899,18 @@ class Edges(Base):
             ].explode("geometry", ignore_index=True)
 
         # Drop cycles
-        self.data = self.data.loc[[len(p.geoms) == 2 for p in self.data.boundary]]
+        if cycles == "ignore":
+            # keep them anyway
+            pass
+        elif cycles == "fix":
+            self.data.geometry = process_map(
+                fix_line, self.data.geometry, chunksize=100, desc="Fixing lines"
+            )
+            self.data = self.data.dropna(subset="geometry", axis="index")
+        elif cycles == "drop":
+            self.data = self.data.loc[[len(p.geoms) == 2 for p in self.data.boundary]]
+        else:
+            raise NotImplementedError()
 
         self.drop_duplicates()
         return self
@@ -2096,6 +2113,31 @@ def mmerge_lines(
     if isinstance(merged, (shapely.LineString, shapely.MultiLineString)):
         return merged
     return lines
+
+
+def fix_line(line: shapely.LineString | shapely.MultiLineString) -> shapely.LineString | None:
+    if isinstance(line, shapely.LineString):
+        boundary = line.boundary
+        if len(boundary.geoms) == 2:
+            return line
+
+        if shapely.is_empty(boundary):
+            # this is a cycle
+            buffer = line.buffer(line.length / 40.0, cap_style="flat")
+            try:
+                fixed = pygeoops.centerline(buffer, min_branch_length=-2, extend=True)
+            except ValueError:
+                return
+
+            if isinstance(fixed, shapely.LineString):
+                return fixed
+
+    elif isinstance(line, shapely.MultiLineString):
+        fixed = _join_multilinestring_(line)
+        if isinstance(fixed, shapely.LineString):
+            return fixed
+
+    pass
 
 
 def __yield_shortest_paths__(
