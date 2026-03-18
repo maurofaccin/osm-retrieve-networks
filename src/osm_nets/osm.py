@@ -789,9 +789,13 @@ class Edges(Base):
             if kind == "e":
                 self._sindex_[kind] = shapely.STRtree(self.data.geometry)
             elif kind == "s":
-                self._sindex_[kind] = shapely.STRtree([p.geoms[0] for p in self.data.boundary])
+                self._sindex_[kind] = shapely.STRtree(
+                    [p.geoms[0] if not shapely.is_empty(p) else p for p in self.data.boundary]
+                )
             elif kind == "t":
-                self._sindex_[kind] = shapely.STRtree([p.geoms[1] for p in self.data.boundary])
+                self._sindex_[kind] = shapely.STRtree(
+                    [p.geoms[1] if not shapely.is_empty(p) else p for p in self.data.boundary]
+                )
             self._sindex_updated_[kind] = True
         return self._sindex_[kind]
 
